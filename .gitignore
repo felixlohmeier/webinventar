@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Ergebnisse von webinventar
+*_services.csv
+*_hosts.csv
+*_ips.csv
+webinventar.json
+inventar*.json
