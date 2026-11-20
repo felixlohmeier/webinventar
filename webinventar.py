@@ -14,7 +14,7 @@ Grundsatz: Externe Dienste erfahren nichts Neues über euer Netz.
   - IP-Adressen eurer Netze werden an keinen externen Dienst geschickt.
 
 Ablauf:
-  1. Hostnamen sammeln: 8 passive Quellen, DNS-Records, Zonentransfer-Versuch,
+  1. Hostnamen sammeln: 7 passive Quellen, DNS-Records, Zonentransfer-Versuch,
      Wortliste, PTR-Records eurer Netze; später Zertifikats-SANs, Redirects und
      Namen aus Seiteninhalt und Headern der abgerufenen Antworten.
   2. Auflösen, Wildcards erkennen, verwaiste CNAMEs melden.
@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.5"
+VERSION = "3.6"
 
 # ============================================================== Einstellungen
 
@@ -167,6 +167,16 @@ SENSITIVE = re.compile(
     r"swagger|actuator|portainer|webmin|router|login|admin|fortinet|fortigate|globalprotect|"
     r"pulse secure|ivanti|citrix|sonicwall|outlook web|exchange|vmware|esxi|vcenter|idrac|"
     r"\bilo\b|ipmi|synology|qnap|plesk|cpanel", re.I)
+
+
+# Typische Fehlerseiten, die technische Details preisgeben (Pfade, Versionen, Code)
+ERROR_DETAILS = re.compile(
+    r"TYPO3 Exception|Traceback \(most recent call last\)|Stack trace:|Fatal error:|"
+    r"Uncaught [\w\\]*Exception|PHP (?:Warning|Notice|Fatal error)|on line <b>\d+</b>|"
+    r"Whoops, looks like something went wrong|Server Error in '/' Application|"
+    r"Exception Details:|Django Version:|java\.lang\.\w+(?:Exception|Error)|"
+    r"SQLSTATE\[|You have an error in your SQL syntax|ORA-\d{5}|"
+    r"Werkzeug Debugger|Symfony\\Component\\|NullPointerException")
 
 
 # ============================================================== Hilfsfunktionen
@@ -447,10 +457,6 @@ def src_hackertarget(d):
     yield http_get(f"https://api.hackertarget.com/hostsearch/?q={d}")
 
 
-def src_subdomaincenter(d):
-    yield http_get(f"https://api.subdomain.center/?domain={d}&engine=cuttlefish", {"Accept": "application/json"})
-
-
 def src_thc(d):
     state = ""
     for _ in range(50):                           # seitenweise per POST
@@ -474,8 +480,7 @@ def src_rapiddns(d):
 
 SOURCES = {
     "crt.sh": src_crtsh, "certspotter": src_certspotter, "shodanct": src_shodanct, "crtname": src_crtname,
-    "hackertarget": src_hackertarget, "subdomaincenter": src_subdomaincenter,
-    "thc": src_thc, "rapiddns": src_rapiddns,
+    "hackertarget": src_hackertarget, "thc": src_thc, "rapiddns": src_rapiddns,
 }
 
 
@@ -511,12 +516,27 @@ def extract_names(text, domain):
 # ============================================================== Drosselung
 
 class RateLimiter:
-    """Begrenzt neue Verbindungen pro Sekunde (über alle Ziele)."""
+    """Begrenzt Anfragen pro Sekunde. Für Nameserver passt sich die Rate an: Jede ausbleibende
+    Antwort senkt sie (bis 5/s), jede Antwort hebt sie wieder bis zum Ausgangswert. Das hält
+    sich bei rund 20 % Verlust die Waage: Erst bei mehr Verlust wird es dauerhaft langsamer –
+    typisch für Rate Limiting, das genau dann aufhört."""
 
     def __init__(self, rate):
-        self.interval = 1.0 / rate if rate else 0.0
+        self.interval = self.base = 1.0 / rate if rate else 0.0
         self.next = 0.0
         self.lock = asyncio.Lock()
+
+    @property
+    def rate(self):
+        return 1 / self.interval if self.interval else 0
+
+    def slow_down(self):
+        if self.interval:
+            self.interval = min(self.interval * 1.5, 0.2)
+
+    def speed_up(self):
+        if self.interval:
+            self.interval = max(self.base, self.interval * 0.9)
 
     async def wait(self):
         if not self.interval:
@@ -751,6 +771,8 @@ class IterativeResolver:
         self.cache = {}            # (name, typ) -> Ergebnis
         self.sem = asyncio.Semaphore(100)
         self.per_server = {}       # Nameserver-IP -> (Semaphore, RateLimiter)
+        self.nx = set()            # Namen, die nachweislich nicht existieren (samt Unternamen)
+        self.throttled = set()     # Nameserver, deren Rate deutlich gesenkt wurde
         self.queries = 0
         self.retries = 0
 
@@ -784,10 +806,26 @@ class IterativeResolver:
                 try:
                     m = await self._query(ip, qname, qtype)
                 except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    self._throttle(ip)
                     continue
+                self.per_server[ip][1].speed_up()
                 if m.rcode in (NOERROR, NXDOMAIN):
                     return m
         return None
+
+    def _throttle(self, ip):
+        """Antwort blieb aus: Rate für diesen Nameserver senken (vermutlich Rate Limiting)."""
+        limiter = self.per_server[ip][1]
+        limiter.slow_down()
+        if limiter.rate < DNS_RATE_PER_SERVER / 3 and ip not in self.throttled:
+            self.throttled.add(ip)
+            log(f"Nameserver {ip} antwortet nicht auf alle Anfragen – Abfragerate gesenkt "
+                f"(jetzt {limiter.rate:.0f}/s)")
+
+    def known_nx(self, name):
+        """Existiert der Name (oder ein übergeordneter Name) nachweislich nicht?"""
+        labels = name.split(".")
+        return any(".".join(labels[i:]) in self.nx for i in range(len(labels)))
 
     @staticmethod
     def _records(section, owner, qtype):
@@ -815,12 +853,18 @@ class IterativeResolver:
                 return True
         return False
 
-    async def servers_for(self, name, depth=0):
+    async def servers_for(self, name, depth=0, include_last=True):
         """Zuständige Nameserver für name suchen (von der Wurzel abwärts, je Label eine Frage).
-        Liefert None, wenn ein übergeordneter Name nicht existiert."""
+        Mit include_last=False endet die Suche beim übergeordneten Namen: Die eigentliche
+        Frage geht dann direkt an dessen Server (RFC 9156 erlaubt das; es erfährt dabei
+        niemand mehr als ohnehin). Liefert None, wenn ein übergeordneter Name nicht existiert."""
+        if self.known_nx(name):
+            return None
+        if name in self.zones:                   # der Name ist selbst eine bekannte Zone
+            return self.zones[name]
         labels = name.split(".")
         zone, servers = "", self.zones[""]
-        for i in range(len(labels) - 1, -1, -1):
+        for i in range(len(labels) - 1, 0 if not include_last else -1, -1):
             child = ".".join(labels[i:])
             if child in self.zones:
                 zone, servers = child, self.zones[child]
@@ -835,7 +879,10 @@ class IterativeResolver:
                 # umgesetzt). Nur bei den Servern der eigenen Domains wird dann der
                 # vollständige Name gestellt; Root, TLDs und fremde Server erfahren ihn nie.
                 own = any(zone == d or zone.endswith("." + d) for d in self.own)
-                return servers if i > 0 and own else None
+                if i > 0 and own:
+                    return servers
+                self.nx.add(child)
+                return None
             ns = [rr.value for rr in self._records(m.answer + m.authority, child, "NS")]
             ips = await self._ns_addresses(m, ns, depth) if ns else []
             if ips:
@@ -850,10 +897,12 @@ class IterativeResolver:
         key = (name.lower().rstrip("."), qtype)
         if key in self.cache:
             return self.cache[key]
+        if self.known_nx(key[0]):                # spart z. B. die AAAA-Frage nach NXDOMAIN
+            return ("nxdomain", [], [])
         chain, cur, result = [], key[0], ("fail", [], [])
         for _ in range(10):                     # CNAME-Ziele und Verweise in andere Zonen
             try:
-                servers = await self.servers_for(cur, depth)
+                servers = await self.servers_for(cur, depth, include_last=False)
             except DNSFail:
                 break
             if servers is None:
@@ -877,6 +926,7 @@ class IterativeResolver:
                 cur = owner
                 continue
             if m.rcode == NXDOMAIN:
+                self.nx.add(cur)
                 result = ("nxdomain", [], chain)
                 break
             if not m.answer and not (m.flags & FLAG_AA) and await self._learn_delegation(m, depth):
@@ -1390,6 +1440,9 @@ class Inventory:
             self.add_host(san, "zertifikat", foreign_ok=self.in_net(ip))
         for r in (res, final):
             self.harvest_names(r)
+            m = ERROR_DETAILS.search(r["body"][:150000]) if r and r.get("http") else None
+            if m and not row.get("error_details"):
+                row["error_details"] = m.group(0)
         self.services.append(row)
 
     def harvest_names(self, res):
@@ -1512,6 +1565,9 @@ class Inventory:
                 self.finding("HTTPS ohne HSTS", url, "kein Strict-Transport-Security-Header")
             if r.get("tls_version") in ("SSLv3", "TLSv1", "TLSv1.1"):
                 self.finding("Veraltetes TLS", url, r["tls_version"])
+            if r.get("error_details"):
+                self.finding("Fehlerseite mit technischen Details", url,
+                             f"enthält „{r['error_details']}“ – kann Pfade, Versionen oder Code verraten")
             text = f"{r.get('title', '')} {r.get('final_title', '')} {r.get('tech', '')}".strip()
             if (status in (200, 401, 403) or r.get("final_status") == 200) and SENSITIVE.search(text):
                 self.finding("Sensible Oberfläche?", url, text[:120])
@@ -1521,7 +1577,7 @@ class Inventory:
         cols = ["url", "scheme", "hostname", "ip", "port", "in_own_net", "status", "title", "tech",
                 "server", "final_url", "final_status", "final_title", "location", "content_type",
                 "length", "response_ms", "body_hash", "hsts", "tls_version", "tls_cipher", "cert_cn",
-                "cert_issuer", "cert_not_after", "cert_valid", "cert_sans", "cname", "ptr",
+                "cert_issuer", "cert_not_after", "cert_valid", "cert_sans", "error_details", "cname", "ptr",
                 "foreign_name", "notes"]
         rows = sorted(self.services, key=lambda r: (ip_sort_key(r["ip"]), r["port"], r["hostname"]))
         with open(f"{prefix}_services.csv", "w", newline="", encoding="utf-8-sig") as f:
@@ -1531,10 +1587,11 @@ class Inventory:
 
         hosts = sorted((h for h in self.hosts.values() if h["status"] not in ("out-of-scope", "wildcard")),
                        key=lambda h: h["name"].split(".")[::-1])
+        csv_hosts = [h for h in hosts if h["status"] != "nxdomain"]   # vollständig nur im JSON
         with open(f"{prefix}_hosts.csv", "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f, delimiter=";")
             w.writerow(["hostname", "status", "a", "aaaa", "cname", "in_own_net", "foreign_name", "sources"])
-            for h in hosts:
+            for h in csv_hosts:
                 addrs = h["a"] + h["aaaa"]
                 w.writerow([h["name"], h["status"], " ".join(h["a"]), " ".join(h["aaaa"]),
                             " -> ".join(h["cname"]),
@@ -1555,7 +1612,8 @@ class Inventory:
             json.dump({"generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "version": VERSION,
                        "scope": {"domains": self.domains, "nets": [str(n) for n in self.nets]},
                        "load": {**self.stats, "dns_queries": self.dns.queries,
-                                "dns_retries": self.dns.retries},
+                                "dns_retries": self.dns.retries,
+                                "dns_throttled_servers": sorted(self.dns.throttled)},
                        "sources": self.source_stats, "findings": list(self.findings.values()),
                        "services": rows,
                        "hosts": [{**h, "sources": sorted(h["sources"])} for h in hosts],

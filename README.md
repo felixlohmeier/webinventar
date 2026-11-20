@@ -14,7 +14,7 @@ Das Tool ist ein einzelnes Python-Skript ohne Abhängigkeiten außer der Standar
 | Die autoritativen Nameserver der eigenen Domains (bzw. der DNS-Provider) | alle Namensabfragen, auch die geratenen | Sie verwalten die Zone ohnehin. |
 | Die Nameserver der eigenen Reverse-Zonen (meist der Netzbetreiber selbst oder dessen Provider) | Rückwärtsabfragen der IP-Adressen | Sie verwalten diese Zonen ohnehin. |
 | Nameserver von Hostern, auf die CNAME-Einträge zeigen | nur deren eigene Namen, auf die die CNAMEs zeigen | Das ist die normale Abfrage, die jeder Besucher der Seite auch auslöst. |
-| 8 öffentliche Quellen (siehe unten) | nur den Domainnamen | Die Domain ist ohnehin öffentlich bekannt. IP-Adressen und Netze werden nicht übertragen. |
+| 7 öffentliche Quellen (siehe unten) | nur den Domainnamen | Die Domain ist ohnehin öffentlich bekannt. IP-Adressen und Netze werden nicht übertragen. |
 | GitHub | Abruf der Technologie-Muster (wöchentlich) | Enthält keinen Bezug zum untersuchten Netz. Mit `--no-tech` abschaltbar. |
 | Die untersuchten Server | die eigentlichen Port- und HTTP-Prüfungen | Das ist der Zweck des Tools. |
 
@@ -33,9 +33,9 @@ Alle Quellen werden parallel abgefragt, jede höchstens 60 Sekunden lang. Was ei
 | Art | Quellen |
 |---|---|
 | Certificate Transparency | crt.sh, Certspotter, Shodan CT (ctl.shodan.io), crt.name |
-| Subdomain- und DNS-Datenbanken | HackerTarget, subdomain.center, THC (ip.thc.org), RapidDNS |
+| Subdomain- und DNS-Datenbanken | HackerTarget, THC (ip.thc.org), RapidDNS |
 
-Die Auswahl beruht auf Testläufen: Quellen, die keine oder kaum Namen lieferten oder nicht erreichbar waren, wurden entfernt. Darunter waren die Wayback Machine und Common Crawl.
+Die Auswahl beruht auf Testläufen: Quellen, die keine oder kaum Namen lieferten oder nicht erreichbar waren, wurden entfernt. Darunter waren die Wayback Machine und Common Crawl. subdomain.center wurde entfernt, weil die Quelle neben echten Namen viele erzeugte Varianten liefert (z. B. `teamworkk`, `www.` vor jedem Namen). In einem Testlauf existierte von 204 solchen Namen keiner.
 
 Die Endpunkte entsprechen denen von [subfinder](https://github.com/projectdiscovery/subfinder). Kleinere Dienste sind gelegentlich nicht erreichbar oder begrenzen die Zahl der kostenlosen Abfragen pro Tag. Das schadet dem Lauf nicht, es fehlen dann nur deren Beiträge.
 
@@ -76,7 +76,7 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 ## Ablauf
 
 1. **Hostnamen sammeln**
-   - 8 passive Quellen: Certificate-Transparency-Logs und Subdomain-Datenbanken (siehe oben)
+   - 7 passive Quellen: Certificate-Transparency-Logs und Subdomain-Datenbanken (siehe oben)
    - DNS-Einträge: NS, MX, SOA, SPF und gängige SRV-Einträge
    - Versuch eines Zonentransfers (AXFR)
    - eingebaute Wortliste mit rund 60 typischen technischen Namen wie `www`, `mail`, `vpn`, `autodiscover` oder `ns1`; mit `-w` erweiterbar
@@ -100,7 +100,7 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 | Datei | Inhalt |
 |---|---|
 | `*_services.csv` | eine Zeile je Webdienst (URL) bzw. offenem Port ohne HTTP |
-| `*_hosts.csv` | alle gefundenen Hostnamen mit Status, IP-Adressen, CNAME-Kette und Fundquelle (z. B. `certspotter`, `wortliste`, `zertifikat`, `http-inhalt`) |
+| `*_hosts.csv` | gefundene Hostnamen mit Status, IP-Adressen, CNAME-Kette und Fundquelle (z. B. `certspotter`, `wortliste`, `zertifikat`, `http-inhalt`). Namen, die nicht mehr existieren (oft alte Einträge aus Zertifikatsverzeichnissen), stehen nur in der JSON-Datei. |
 | `*_ips.csv` | je IP-Adresse: PTR-Eintrag, offene Ports, Hostnamen und Sperrhinweis |
 | `*.json` | alles zusammen, dazu Statistik und Auffälligkeiten |
 
@@ -126,6 +126,7 @@ Wichtige Spalten in `*_services.csv`:
 - HTTPS ohne HSTS (nur bei gültigem Zertifikat)
 - Zertifikat abgelaufen, ungültig oder läuft in weniger als 30 Tagen ab
 - veraltetes TLS (1.0 oder 1.1)
+- Fehlerseiten mit technischen Details, z. B. „TYPO3 Exception“, PHP-Fehlermeldungen, Stack Traces oder SQL-Fehler
 - mögliche sensible Oberflächen, z. B. Login- und Admin-Seiten, VPN-Portale, Jenkins, phpMyAdmin, Swagger UI
 - Scanner vermutlich gesperrt (siehe unten)
 
@@ -139,7 +140,7 @@ Gleiche Befunde werden zu einem Eintrag mit allen betroffenen Adressen zusammeng
 | `normal` | 100 | 4 | 5 min |
 | `schnell` | unbegrenzt | 50 | 2 min |
 
-Dazu kommen pro Lauf etwa 2–4 Minuten für passive Quellen (höchstens 60 Sekunden, parallel zur DNS-Phase), DNS und HTTP-Abrufe. DNS-Anfragen werden auf 20 pro Sekunde je Nameserver begrenzt, damit dessen Rate Limiting nicht greift. Bleibt eine Antwort trotzdem aus, wiederholt das Tool die Anfrage nach einer kurzen Pause. Namen, die danach noch ohne Antwort sind, versucht es nach 10 Sekunden ein weiteres Mal. In der JSON-Datei stehen unter `load` die Zahl der DNS-Anfragen und der Wiederholungen. Je Hostname sendet das Tool nur `GET /`, ohne Pfade durchzuprobieren oder Logins zu versuchen. Am Ende zeigt es, wie viele Verbindungen es auf den untersuchten Systemen erzeugt hat.
+Dazu kommen pro Lauf etwa 2–4 Minuten für passive Quellen (höchstens 60 Sekunden, parallel zur DNS-Phase), DNS und HTTP-Abrufe. DNS-Anfragen werden auf höchstens 20 pro Sekunde je Nameserver begrenzt. Bleiben Antworten aus, weil der Nameserver Anfragen drosselt (Rate Limiting), senkt das Tool die Rate für diesen Server selbstständig, bis auf 5 pro Sekunde, und hebt sie bei Antworten wieder an. Fehlende Antworten wiederholt es nach einer kurzen Pause. Nicht existierende Namen merkt es sich, damit dazu keine weiteren Anfragen nötig sind. Namen, die danach noch ohne Antwort sind, versucht es nach 10 Sekunden ein weiteres Mal. In der JSON-Datei stehen unter `load` die Zahl der DNS-Anfragen, der Wiederholungen und die Nameserver, deren Rate gesenkt wurde. Je Hostname sendet das Tool nur `GET /`, ohne Pfade durchzuprobieren oder Logins zu versuchen. Am Ende zeigt es, wie viele Verbindungen es auf den untersuchten Systemen erzeugt hat.
 
 **Sperr-Erkennung:** Das Tool merkt sich pro IP-Adresse einen Port, der nachweislich offen war. Nach dem Portscan und nach jeder Runde HTTP-Abrufe prüft es diesen Port erneut. Antwortet er nicht mehr, hat vermutlich fail2ban, ein IPS oder eine WAF den Scanner gesperrt. Dann warnt das Tool und markiert die Ergebnisse dieser IP-Adresse als unvollständig.
 
