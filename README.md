@@ -14,15 +14,29 @@ Das Tool ist ein einzelnes Python-Skript ohne Abhängigkeiten außer der Standar
 | Die autoritativen Nameserver der eigenen Domains (bzw. der DNS-Provider) | alle Namensabfragen, auch die geratenen | Sie verwalten die Zone ohnehin. |
 | Die Nameserver der eigenen Reverse-Zonen (meist der Netzbetreiber selbst oder dessen Provider) | Rückwärtsabfragen der IP-Adressen | Sie verwalten diese Zonen ohnehin. |
 | Nameserver von Hostern, auf die CNAME-Einträge zeigen | nur deren eigene Namen, auf die die CNAMEs zeigen | Das ist die normale Abfrage, die jeder Besucher der Seite auch auslöst. |
-| crt.sh, Certspotter, Internet Archive, Common Crawl | nur den Domainnamen | Reine Lesezugriffe auf öffentliche Archive, die die Domain bereits kennen. |
+| 19 öffentliche Quellen (siehe unten) | nur den Domainnamen | Die Domain ist ohnehin öffentlich bekannt. IP-Adressen und Netze werden nicht übertragen. |
 | GitHub | Abruf der Technologie-Muster (wöchentlich) | Enthält keinen Bezug zum untersuchten Netz. Mit `--no-tech` abschaltbar. |
 | Die untersuchten Server | die eigentlichen Port- und HTTP-Prüfungen | Das ist der Zweck des Tools. |
 
 Bewusst **nicht** verwendet:
 
 - **Öffentliche DNS-Resolver** wie Google, Cloudflare oder Quad9. Sie würden jeden geratenen Namen sehen, und solche Namen landen oft in Passive-DNS-Datenbanken.
-- **Dienste, die IP-Adressen entgegennehmen**, etwa Shodan oder ASN-Abfragen.
-- **Sammeldienste mit unklarer Datennutzung**, also Quellen, die Anfragen speichern oder daraufhin selbst scannen.
+- **Dienste, die IP-Adressen entgegennehmen**, etwa Shodan InternetDB oder ASN-Abfragen.
+- **Quellen, die eine Anmeldung oder einen API-Schlüssel erfordern.**
+
+Ob einzelne Quellen die angefragten Domainnamen speichern, anzeigen oder daraufhin selbst untersuchen, ist nicht bekannt. Übertragen wird in jedem Fall nur der Domainname.
+
+### Passive Quellen
+
+Alle Quellen werden parallel abgefragt, jede höchstens 60 Sekunden lang. Was eine Quelle bis dahin geliefert hat, wird ausgewertet. In der Zusammenfassung steht, welche Quellen nicht erreichbar waren, welche abgebrochen wurden und wie viele neue Namen jede beigetragen hat.
+
+| Art | Quellen |
+|---|---|
+| Certificate Transparency | crt.sh, Certspotter, Shodan CT (ctl.shodan.io), crt.name, certificatedetails.com |
+| Web-Archive | Internet Archive (Wayback Machine), Common Crawl |
+| Subdomain- und DNS-Datenbanken | HackerTarget, Anubis, ThreatMiner, Riddler, recon.cloud, Reconeer, subdomain.center, sub.md, ScanMalware, THC (ip.thc.org), RapidDNS, Sitedossier |
+
+Die Endpunkte entsprechen denen von [subfinder](https://github.com/projectdiscovery/subfinder). Kleinere Dienste sind gelegentlich nicht erreichbar oder begrenzen die Zahl der kostenlosen Abfragen pro Tag. Das schadet dem Lauf nicht, es fehlen dann nur deren Beiträge.
 
 ## Voraussetzungen
 
@@ -61,8 +75,7 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 ## Ablauf
 
 1. **Hostnamen sammeln**
-   - Certificate-Transparency-Logs (crt.sh, Certspotter)
-   - Web-Archive (Wayback Machine, Common Crawl)
+   - 19 passive Quellen: Certificate-Transparency-Logs, Web-Archive und Subdomain-Datenbanken (siehe oben)
    - DNS-Einträge: NS, MX, SOA, SPF und gängige SRV-Einträge
    - Versuch eines Zonentransfers (AXFR)
    - eingebaute Wortliste mit rund 260 Namen
@@ -125,7 +138,7 @@ Gleiche Befunde werden zu einem Eintrag mit allen betroffenen Adressen zusammeng
 | `normal` | 100 | 4 | 5 min |
 | `schnell` | unbegrenzt | 50 | 2 min |
 
-Dazu kommen pro Lauf etwa 2–5 Minuten für Archive, DNS und HTTP-Abrufe. DNS-Anfragen werden auf 20 pro Sekunde je Nameserver begrenzt, damit dessen Rate Limiting nicht greift. Bleibt eine Antwort trotzdem aus, wiederholt das Tool die Anfrage nach einer kurzen Pause. Namen, die danach noch ohne Antwort sind, versucht es nach 10 Sekunden ein weiteres Mal. In der JSON-Datei stehen unter `load` die Zahl der DNS-Anfragen und der Wiederholungen. Je Hostname sendet das Tool nur `GET /`, ohne Pfade durchzuprobieren oder Logins zu versuchen. Am Ende zeigt es, wie viele Verbindungen es auf den untersuchten Systemen erzeugt hat.
+Dazu kommen pro Lauf etwa 2–4 Minuten für passive Quellen (höchstens 60 Sekunden, parallel zur DNS-Phase), DNS und HTTP-Abrufe. DNS-Anfragen werden auf 20 pro Sekunde je Nameserver begrenzt, damit dessen Rate Limiting nicht greift. Bleibt eine Antwort trotzdem aus, wiederholt das Tool die Anfrage nach einer kurzen Pause. Namen, die danach noch ohne Antwort sind, versucht es nach 10 Sekunden ein weiteres Mal. In der JSON-Datei stehen unter `load` die Zahl der DNS-Anfragen und der Wiederholungen. Je Hostname sendet das Tool nur `GET /`, ohne Pfade durchzuprobieren oder Logins zu versuchen. Am Ende zeigt es, wie viele Verbindungen es auf den untersuchten Systemen erzeugt hat.
 
 **Sperr-Erkennung:** Das Tool merkt sich pro IP-Adresse einen Port, der nachweislich offen war. Nach dem Portscan und nach jeder Runde HTTP-Abrufe prüft es diesen Port erneut. Antwortet er nicht mehr, hat vermutlich fail2ban, ein IPS oder eine WAF den Scanner gesperrt. Dann warnt das Tool und markiert die Ergebnisse dieser IP-Adresse als unvollständig.
 
@@ -134,7 +147,7 @@ Empfehlung: Die IP-Adresse des Scan-Rechners in fail2ban (`ignoreip`), im IPS un
 ## Grenzen
 
 - **Ports:** Es wird nur die gewählte Portliste geprüft. Mit `-p all` sind alle Ports abgedeckt, das dauert aber sehr lange. Für große Netze besser vorher masscan oder naabu laufen lassen und die offenen Ports mit `-p` übergeben.
-- **Archive:** Hostnamen, die in keinem Zertifikat, keinem Archiv, keiner Wortliste und keinem DNS-Eintrag vorkommen, findet das Tool nur, wenn sie in die angegebenen Netze zeigen oder auf einer gefundenen Seite verlinkt sind. Verlinkte JavaScript-Dateien werden dabei nicht zusätzlich abgerufen. Gegenüber Tools wie subfinder fehlen bewusst die Sammeldienste. Das kostet etwas Vollständigkeit bei den Hostnamen.
+- **Archive:** Hostnamen, die in keinem Zertifikat, keinem Archiv, keiner Wortliste und keinem DNS-Eintrag vorkommen, findet das Tool nur, wenn sie in die angegebenen Netze zeigen oder auf einer gefundenen Seite verlinkt sind. Verlinkte JavaScript-Dateien werden dabei nicht zusätzlich abgerufen. Gegenüber Tools wie subfinder fehlen die Quellen, die einen API-Schlüssel erfordern.
 - **IPv6:** Netze größer als /112 werden nicht vollständig durchsucht. Geprüft werden nur IPv6-Adressen, auf die ein DNS-Name zeigt.
 - **Technologie-Erkennung:** Erkannt wird, was sich aus Headern und HTML ablesen lässt. Was erst durch JavaScript im Browser sichtbar wird, fehlt.
 - **Gesperrte Abfragen:** Antworten einzelne Archive nicht, etwa weil crt.sh ausgelastet ist, steht das in der Zusammenfassung unter „nicht erreichbar“. Dann den Lauf später wiederholen.

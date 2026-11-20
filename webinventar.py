@@ -9,13 +9,12 @@ Grundsatz: Externe Dienste erfahren nichts Neues über euer Netz.
     sehen nur die autoritativen Nameserver eurer Zonen, also ihr selbst bzw.
     euer DNS-Provider. Öffentliche Resolver (Google, Cloudflare, …) werden nicht
     benutzt; so landen auch geratene Namen in keiner Passive-DNS-Datenbank.
-  - Passive Quellen: nur reine Lesezugriffe auf öffentliche Archive, die eure
-    Domain ohnehin kennen (Certificate-Transparency-Logs, Web-Archive). Diese
-    Dienste bekommen nur den Domainnamen, keine IP-Adressen oder Netze.
+  - Passive Quellen (CT-Logs, Web-Archive, Subdomain-Datenbanken): Diese Dienste
+    bekommen nur den Domainnamen, keine IP-Adressen oder Netze.
   - IP-Adressen eurer Netze werden an keinen externen Dienst geschickt.
 
 Ablauf:
-  1. Hostnamen sammeln: CT-Logs, Web-Archive, DNS-Records, Zonentransfer-Versuch,
+  1. Hostnamen sammeln: 19 passive Quellen, DNS-Records, Zonentransfer-Versuch,
      Wortliste, PTR-Records eurer Netze; später Zertifikats-SANs, Redirects und
      Namen aus Seiteninhalt und Headern der abgerufenen Antworten.
   2. Auflösen, Wildcards erkennen, verwaiste CNAMEs melden.
@@ -30,6 +29,7 @@ Nur gegen Netze und Domains einsetzen, für die ihr berechtigt seid.
 """
 import argparse
 import asyncio
+import concurrent.futures
 import csv
 import hashlib
 import ipaddress
@@ -42,12 +42,13 @@ import ssl
 import string
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.3"
+VERSION = "3.4"
 
 # ============================================================== Einstellungen
 
@@ -130,7 +131,7 @@ DNS_TIMEOUT = 3.0         # Sekunden je DNS-Anfrage
 DNS_RATE_PER_SERVER = 20  # Anfragen/s je Nameserver – bleibt unter üblichen Rate-Limits (RRL)
 DNS_ROUNDS = 3            # Versuche je Frage (mit Pause), falls Antworten verloren gehen
 CERT_WARN_DAYS = 30       # Warnung, wenn ein Zertifikat in weniger Tagen abläuft
-SOURCE_TIMEOUT = 300      # Sekunden je passiver Quelle und Domain
+SOURCE_TIMEOUT = 60       # Sekunden je passiver Quelle und Domain (danach zählt, was bis dahin da ist)
 MAX_ADDRESSES = 65536     # größere Netze bitte aufteilen oder masscan/naabu vorschalten
 CACHE_DIR = os.path.expanduser("~/.cache/webinventar")
 FINGERPRINT_URL = "https://raw.githubusercontent.com/projectdiscovery/wappalyzergo/main/fingerprints_data.json"
@@ -383,36 +384,68 @@ class TechDetector:
 
 
 # ============================================================== Passive Quellen
-# Nur Lesezugriffe auf öffentliche Archive; gesendet wird ausschließlich der Domainname.
+# Öffentliche Quellen ohne Anmeldung; gesendet wird ausschließlich der Domainname.
 # Endpunkte wie in projectdiscovery/subfinder. Jede Funktion liefert Rohtext, aus dem
-# die Hostnamen per Regex gezogen werden.
+# die Hostnamen per Regex gezogen werden. Alle Quellen laufen parallel, jede höchstens
+# SOURCE_TIMEOUT Sekunden; was bis dahin geladen ist, wird ausgewertet.
 
-def http_get(url, timeout=120):
-    req = urllib.request.Request(url, headers={"User-Agent": f"webinventar/{VERSION}"})
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+_source_state = threading.local()   # Frist der gerade laufenden Quelle (je Thread)
+
+
+class SourceTimeout(Exception):
+    pass
+
+
+def http_get(url, headers=None, data=None, allow_error=False):
+    """Abruf mit harter Frist: Auch ein langsamer Download endet spätestens zur Frist der
+    Quelle; was bis dahin geladen ist, wird zurückgegeben. Wiederholt bei Überlastung."""
+    deadline = getattr(_source_state, "deadline", time.monotonic() + SOURCE_TIMEOUT)
+    hdr = {"User-Agent": BROWSER_UA, "Accept": "*/*"}
+    hdr.update(headers or {})
+    last_error = None
     for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            raise last_error or SourceTimeout()   # Frist vorbei: Fehler melden, falls es einen gab
+        req = urllib.request.Request(url, headers=hdr, data=data, method="POST" if data else "GET")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read(50_000_000).decode("utf-8", "replace")
+            with urllib.request.urlopen(req, timeout=min(15, remaining)) as r:
+                chunks, size = [], 0
+                while size < 50_000_000:
+                    if time.monotonic() > deadline:
+                        _source_state.truncated = True
+                        break
+                    chunk = r.read1(65536)        # liefert, was gerade da ist (Frist prüfbar)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                return b"".join(chunks).decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
+            if allow_error and e.code < 500:      # manche Seiten liefern Namen auch mit 404
+                return e.read(5_000_000).decode("utf-8", "replace")
             if e.code not in (429, 500, 502, 503, 504) or attempt == 2:
                 raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
-            if attempt == 2:
+            last_error = e
+        except OSError as e:                      # Verbindungsfehler, Zeitüberschreitung
+            if attempt == 2 or time.monotonic() > deadline:
                 raise
-        time.sleep(5 * (attempt + 1))
+            last_error = e
+        time.sleep(max(0, min(5 * (attempt + 1), deadline - time.monotonic() - 1)))
     return ""
 
 
+# --- Certificate Transparency
 def src_crtsh(d):
-    """Certificate Transparency über crt.sh"""
     yield http_get(f"https://crt.sh/?q=%25.{d}&output=json")
 
 
 def src_certspotter(d):
-    """Certificate Transparency über Certspotter (seitenweise)"""
     url = f"https://api.certspotter.com/v1/issuances?domain={d}&include_subdomains=true&expand=dns_names"
     after = None
-    for _ in range(50):
+    for _ in range(50):                           # seitenweise
         text = http_get(url + (f"&after={after}" if after else ""))
         yield text
         data = json.loads(text or "[]")
@@ -421,24 +454,129 @@ def src_certspotter(d):
         after = data[-1]["id"]
 
 
+def src_shodanct(d):
+    yield http_get(f"https://ctl.shodan.io/api/v1/domain/{d}/hostnames")
+
+
+def src_crtname(d):
+    yield http_get(f"https://crt.name/v1/search?apex={d}")
+
+
+def src_digitorus(d):
+    yield http_get(f"https://certificatedetails.com/{d}", allow_error=True)
+
+
+# --- Web-Archive
 def src_wayback(d):
-    """Internet Archive (Wayback Machine)"""
-    yield http_get(f"https://web.archive.org/cdx/search/cdx?url=*.{d}/*&output=txt&fl=original&collapse=urlkey",
-                   timeout=240)
+    yield http_get(f"https://web.archive.org/cdx/search/cdx?url=*.{d}/*&output=txt&fl=original&collapse=urlkey")
 
 
 def src_commoncrawl(d):
-    """Common Crawl: neuester Index des aktuellen und des Vorjahres"""
     indexes = json.loads(http_get("https://index.commoncrawl.org/collinfo.json") or "[]")
     year = time.gmtime().tm_year
-    for y in (str(year), str(year - 1)):
+    for y in (str(year), str(year - 1)):          # neuester Index dieses und des Vorjahres
         idx = next((i for i in indexes if y in i.get("id", "")), None)
         if idx:
-            yield http_get(f"{idx['cdx-api']}?url=*.{d}&fl=url", timeout=240)
+            yield http_get(f"{idx['cdx-api']}?url=*.{d}&fl=url")
 
 
-SOURCES = {"crt.sh": src_crtsh, "certspotter": src_certspotter,
-           "wayback": src_wayback, "commoncrawl": src_commoncrawl}
+# --- Subdomain- und DNS-Datenbanken
+def src_hackertarget(d):
+    yield http_get(f"https://api.hackertarget.com/hostsearch/?q={d}")
+
+
+def src_anubis(d):
+    yield http_get(f"https://anubisdb.com/anubis/subdomains/{d}")
+
+
+def src_threatminer(d):
+    yield http_get(f"https://api.threatminer.org/v2/domain.php?q={d}&rt=5")
+
+
+def src_riddler(d):
+    yield http_get(f"https://riddler.io/search?q=pld:{d}&view_type=data_table")
+
+
+def src_reconcloud(d):
+    yield http_get(f"https://recon.cloud/api/search?domain={d}")
+
+
+def src_reconeer(d):
+    yield http_get(f"https://www.reconeer.com/api/domain/{d}")
+
+
+def src_subdomaincenter(d):
+    yield http_get(f"https://api.subdomain.center/?domain={d}&engine=cuttlefish", {"Accept": "application/json"})
+
+
+def src_submd(d):
+    yield http_get(f"https://api.sub.md/v1/search?apex={d}")
+
+
+def src_scanmalware(d):
+    yield http_get(f"https://scanmalware.com/api/v1/ct/dns/{d}?subdomain_limit=5000",
+                   {"User-Agent": "scanmalware-subfinder/1.0 (+https://github.com/projectdiscovery/subfinder)"})
+
+
+def src_thc(d):
+    state = ""
+    for _ in range(50):                           # seitenweise per POST
+        body = json.dumps({"domain": d, "page_state": state, "limit": 1000}).encode()
+        text = http_get("https://ip.thc.org/api/v1/lookup/subdomains", {"Content-Type": "application/json"}, body)
+        yield text
+        state = (json.loads(text or "{}") or {}).get("next_page_state") or ""
+        if not state:
+            return
+
+
+def src_rapiddns(d):
+    page, last = 1, 1
+    while page <= min(last, 10):                  # seitenweise, höchstens 10 Seiten
+        text = http_get(f"https://rapiddns.io/subdomain/{d}?page={page}&full=1")
+        yield text
+        pages = [int(x) for x in re.findall(r'class="page-link" href="/subdomain/[^"]+\?page=(\d+)"', text)]
+        last = max(pages + [last])
+        page += 1
+
+
+def src_sitedossier(d):
+    url = f"http://www.sitedossier.com/parentdomain/{d}"
+    for _ in range(10):                           # Folgeseiten über den "weiter"-Link
+        text = http_get(url)
+        yield text
+        m = re.search(r'<a href="([A-Za-z0-9/.]+)"><b>', text)
+        if not m:
+            return
+        url = "http://www.sitedossier.com" + m.group(1)
+
+
+SOURCES = {
+    "crt.sh": src_crtsh, "certspotter": src_certspotter, "shodanct": src_shodanct,
+    "crtname": src_crtname, "digitorus": src_digitorus,
+    "wayback": src_wayback, "commoncrawl": src_commoncrawl,
+    "hackertarget": src_hackertarget, "anubis": src_anubis, "threatminer": src_threatminer,
+    "riddler": src_riddler, "reconcloud": src_reconcloud, "reconeer": src_reconeer,
+    "subdomaincenter": src_subdomaincenter, "submd": src_submd, "scanmalware": src_scanmalware,
+    "thc": src_thc, "rapiddns": src_rapiddns, "sitedossier": src_sitedossier,
+}
+
+
+def run_source(src, domain):
+    """Eine Quelle abarbeiten (läuft in einem eigenen Thread). Liefert die gefundenen Namen
+    und ob die Frist erreicht wurde; Teilergebnisse bleiben erhalten."""
+    _source_state.deadline = time.monotonic() + SOURCE_TIMEOUT
+    _source_state.truncated = False
+    names = set()
+    try:
+        for text in SOURCES[src](domain):
+            if text:
+                names |= extract_names(text, domain)
+    except SourceTimeout:
+        return names, True
+    except ValueError:                            # abgeschnittenes JSON nach Fristende
+        if not _source_state.truncated:
+            raise
+    return names, _source_state.truncated
 
 
 def extract_names(text, domain):
@@ -925,27 +1063,32 @@ class Inventory:
 
     # ---------------------------------------------------------- Phase 1: Namen sammeln
     async def collect_passive(self):
-        """CT-Logs und Web-Archive abfragen (nur Domainnamen werden übertragen)."""
-        sem = asyncio.Semaphore(4)
+        """Alle passiven Quellen parallel abfragen, je Quelle höchstens SOURCE_TIMEOUT Sekunden.
+        Übertragen wird nur der Domainname."""
+        loop = asyncio.get_running_loop()
+        jobs = [(s, d) for d in self.domains for s in SOURCES]
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(64, len(jobs)))
 
         async def one(src, d):
-            st = self.source_stats.setdefault(src, {"names": 0, "new": 0, "error": ""})
-            async with sem:
-                t0 = time.time()
-                try:
-                    def run():
-                        return set().union(*[extract_names(t, d) for t in SOURCES[src](d) if t])
-                    names = await asyncio.wait_for(asyncio.to_thread(run), SOURCE_TIMEOUT)
-                except Exception as e:  # noqa: BLE001
-                    st["error"] = e.__class__.__name__
-                    log(f"  {src:<12} {d}: nicht erreichbar ({st['error']})")
-                    return
+            st = self.source_stats.setdefault(src, {"names": 0, "new": 0, "error": "", "timeout": False})
+            t0 = time.time()
+            try:
+                names, timed_out = await loop.run_in_executor(pool, run_source, src, d)
+            except Exception as e:  # noqa: BLE001
+                st["error"] = e.__class__.__name__
+                log(f"  {src:<16} {d}: nicht erreichbar ({st['error']}, {time.time() - t0:.0f}s)")
+                return
             new = sum(self.add_host(n, src) for n in names)
             st["names"] += len(names)
             st["new"] += new
-            log(f"  {src:<12} {d}: {len(names):>5} Namen, {new:>4} neu ({time.time() - t0:.0f}s)")
-        log(f"Passive Quellen: {', '.join(SOURCES)}")
-        await asyncio.gather(*[one(s, d) for d in self.domains for s in SOURCES])
+            st["timeout"] |= timed_out
+            note = f" – nach {SOURCE_TIMEOUT}s abgebrochen, Teilergebnis" if timed_out else ""
+            log(f"  {src:<16} {d}: {len(names):>5} Namen, {new:>4} neu ({time.time() - t0:.0f}s){note}")
+        log(f"Passive Quellen ({len(SOURCES)}, parallel, je max. {SOURCE_TIMEOUT}s): {', '.join(SOURCES)}")
+        try:
+            await asyncio.gather(*[one(s, d) for s, d in jobs])
+        finally:
+            pool.shutdown(wait=False)
 
     async def collect_dns(self):
         """NS, MX, SOA, TXT (SPF), SRV und Zonentransfer-Versuch je Domain."""
@@ -1507,6 +1650,12 @@ class Inventory:
         failed = [s for s, v in self.source_stats.items() if v["error"] and not v["names"]]
         if failed:
             print(f"  nicht erreichbar:  {', '.join(failed)}")
+        cut = [s for s, v in self.source_stats.items() if v.get("timeout")]
+        if cut:
+            print(f"  nach {SOURCE_TIMEOUT}s abgebrochen (Teilergebnis): {', '.join(cut)}")
+        useful = sorted(((v["new"], s) for s, v in self.source_stats.items() if v["new"]), reverse=True)
+        if useful:
+            print("  neue Namen je Quelle: " + ", ".join(f"{s} {n}" for n, s in useful))
         print(f"Offene Ports:       {sum(map(len, self.open_ports.values()))} auf {len(self.open_ports)} IPs")
         print(f"Webdienste (URLs):  {len(web)}")
         for url in sorted(web)[:60]:
