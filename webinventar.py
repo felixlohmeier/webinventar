@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.7"
+VERSION = "3.8"
 SCHEMA_VERSION = "2"
 
 # ============================================================== Einstellungen
@@ -1342,7 +1342,7 @@ class Inventory:
         out.update({
             "http": True,
             "status": int(status[1]) if len(status) > 1 and status[1].isdigit() else 0,
-            "title": re.sub(r"\s+", " ", title.group(1)).strip()[:200] if title else "",
+            "title": html.unescape(re.sub(r"\s+", " ", title.group(1)).strip())[:200] if title else "",
             "server": headers.get("server", ""),
             "location": headers.get("location", ""),
             "content_type": headers.get("content-type", "").split(";")[0],
@@ -1559,7 +1559,7 @@ class Inventory:
                     self.finding("Umleitung von HTTPS auf HTTP", url, f"leitet auf {target} um")
             # Zertifikate: gruppiert je Zertifikat, damit ein gemeinsames Zertifikat nur einmal erscheint
             if r.get("cert_not_after"):
-                cert = f"{r.get('cert_cn', '')} (gültig bis {r['cert_not_after']})"
+                cert = f"{r.get('cert_cn', '')} (gültig bis {iso_cert_time(r['cert_not_after'])[:10]})"
                 try:
                     days = (ssl.cert_time_to_seconds(r["cert_not_after"]) - now) / 86400
                 except ValueError:
@@ -1731,14 +1731,14 @@ class Inventory:
             tech = ", ".join(t.replace(":", " ") for t in r.get("tech", []) if t not in TECH_NOISE)
             key = (ip_sort_key(r["ip"]), r["port"], r["scheme"], status, self.title_label(r), tech,
                    self.cert_label(r))
-            groups.setdefault(key, []).append(r["hostname"])
+            groups.setdefault(key, []).append(r)
         rows = []
-        for key, names in sorted(groups.items()):
+        for key, members in sorted(groups.items()):
             _, port, scheme, status, title, tech, cert = key
-            ip = next(r["ip"] for r in self.services if ip_sort_key(r["ip"]) == key[0])
-            shown = (["(IP)"] if "" in names else []) + sorted(self.short(n) for n in names if n)
-            rows.append([scheme, f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}", status, title, tech,
-                         cert, cap_list(shown, 70)])
+            ip = members[0]["ip"]
+            # alle URLs, je eine Zeile, damit sie sich direkt im Browser öffnen lassen
+            urls = [r["url"] for r in sorted(members, key=lambda r: (r["hostname"] != "", r["hostname"]))]
+            rows.append([urls, status, title, tech, cert, f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"])
         return rows, hidden
 
     def quiet_table(self):
@@ -1781,8 +1781,8 @@ class Inventory:
     def summary(self, path, runtime):
         rows, hidden = self.web_table()
         print(f"\n=== Webdienste ({len(rows)}) ===")
-        print_table(["", "Adresse", "Status", "Titel / Ziel", "Technik", "Zertifikat", "Hostnamen"],
-                    rows, [5, 40, 9, 45, 32, 24, 0])
+        print_table(["URL", "Status", "Titel / Ziel", "Technik", "Zertifikat", "IP:Port"],
+                    rows, [0, 9, 45, 32, 24, 0])
         if hidden:
             print(f"({hidden} HTTP-Adressen, die nur auf HTTPS desselben Namens umleiten, nicht aufgeführt)")
         quiet = self.quiet_table()
@@ -1798,10 +1798,10 @@ class Inventory:
         if self.findings:
             print(f"\n=== Auffälligkeiten ({len(self.findings)}) ===")
             for fd in self.sorted_findings():
-                t = fd["targets"]
-                more = f" … und {len(t) - 5} weitere" if len(t) > 5 else ""
                 level = SEVERITY_LABEL[SEVERITY.get(fd["type"], 1)]
-                print(f"  [{level}] {fd['type']}: {fd['detail']}\n           {', '.join(t[:5])}{more}")
+                print(f"  [{level}] {fd['type']}: {fd['detail']}")
+                for target in sorted(fd["targets"], key=target_sort_key):
+                    print(f"           {target}")
 
         print("\n=== Statistik ===")
         unresolved = sum(h["status"] not in KEEP_STATUS and h["status"] not in ("out-of-scope", "pending")
@@ -1883,14 +1883,25 @@ def cap_list(items, width):
 
 
 def print_table(headers, rows, widths):
-    """Einfache Texttabelle; widths begrenzt die Spaltenbreite (0 = unbegrenzt, letzte Spalte)."""
+    """Einfache Texttabelle; widths begrenzt die Spaltenbreite (0 = unbegrenzt). Eine Zelle
+    darf eine Liste sein: weitere Einträge stehen dann in eigenen Zeilen darunter."""
     def cut(v, w):
         v = str(v)
         return v if not w or len(v) <= w else v[:w - 1] + "…"
-    rows = [[cut(v, w) for v, w in zip(r, widths)] for r in rows]
-    size = [max([len(h)] + [len(r[k]) for r in rows]) for k, h in enumerate(headers)]
-    for r in [headers] + rows:
-        print("  " + "  ".join(v.ljust(size[k]) if k < len(r) - 1 else v for k, v in enumerate(r)).rstrip())
+    lines = []
+    for r in rows:
+        cells = [v if isinstance(v, list) else [v] for v in r]
+        for n in range(max(len(c) for c in cells)):
+            lines.append([cut(c[n], w) if n < len(c) else "" for c, w in zip(cells, widths)])
+    size = [max([len(h)] + [len(ln[k]) for ln in lines]) for k, h in enumerate(headers)]
+    for ln in [headers] + lines:
+        print("  " + "  ".join(v.ljust(size[k]) if k < len(ln) - 1 else v for k, v in enumerate(ln)).rstrip())
+
+
+def target_sort_key(target):
+    """URLs und Hostnamen nach Name sortieren, gleiche Namen mit https vor http."""
+    p = urllib.parse.urlsplit(target if "://" in target else f"//{target}")
+    return (p.hostname or target, p.scheme != "https", target)
 
 
 def output_path(out, first, started):

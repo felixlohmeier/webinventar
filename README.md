@@ -97,9 +97,9 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 
 Die Übersicht erscheint auf der Standardausgabe (STDOUT) und lässt sich mit `> bericht.txt` speichern. Fortschrittsmeldungen gehen auf STDERR. Die Übersicht hat vier Teile:
 
-1. **Webdienste:** eine Zeile je IP-Adresse und Port mit gleicher Antwort, also gleichem Status, Titel, gleicher Technik und gleichem Zertifikatsstatus. Alle Hostnamen mit dieser Antwort stehen in derselben Zeile. Ist nur eine Domain angegeben, fehlt sie in den Hostnamen, aus `www.example.de` wird also `www`. `(IP)` bedeutet: Abruf ohne Hostnamen. HTTP-Adressen, die nur auf HTTPS desselben Namens umleiten, werden nur gezählt.
-2. **Ohne Webdienst:** IP-Adressen mit Hostnamen oder offenen Ports, die kein HTTP sprechen. Aufeinanderfolgende Adressen mit durchnummerierten Namen werden zusammengefasst, z. B. `203.0.113.10 – 19  pc-0 … 9`.
-3. **Auffälligkeiten**, nach Schwere sortiert (`hoch`, `mittel`, `gering`).
+1. **Webdienste:** eine Zeile je IP-Adresse und Port mit gleicher Antwort, also gleichem Status, Titel, gleicher Technik und gleichem Zertifikatsstatus. Alle URLs mit dieser Antwort stehen untereinander in der ersten Spalte und lassen sich direkt im Browser öffnen. HTTP-Adressen, die nur auf HTTPS desselben Namens umleiten, werden nur gezählt.
+2. **Ohne Webdienst:** IP-Adressen mit Hostnamen oder offenen Ports, die kein HTTP sprechen. Ist nur eine Domain angegeben, fehlt sie in den Hostnamen, aus `www.example.de` wird also `www`. Aufeinanderfolgende Adressen mit durchnummerierten Namen werden zusammengefasst, z. B. `203.0.113.10 – 19  pc-0 … 9`.
+3. **Auffälligkeiten**, nach Schwere sortiert (`hoch`, `mittel`, `gering`), jeweils mit allen betroffenen Adressen.
 4. **Statistik:** Hostnamen, Quellen, offene Ports, Last und Pfad der JSON-Datei.
 
 ### JSON-Datei
