@@ -108,10 +108,14 @@ Wichtige Spalten in `*_services.csv`:
 - Zonentransfer möglich
 - verwaister CNAME, also Gefahr einer Subdomain-Übernahme
 - HTTP ohne Weiterleitung auf HTTPS
-- Zertifikat abgelaufen oder ungültig
+- Umleitung von HTTPS auf HTTP
+- HTTPS ohne HSTS (nur bei gültigem Zertifikat)
+- Zertifikat abgelaufen, ungültig oder läuft in weniger als 30 Tagen ab
 - veraltetes TLS (1.0 oder 1.1)
-- mögliche sensible Oberflächen, z. B. Login- und Admin-Seiten, VPN-Portale, Jenkins, phpMyAdmin
+- mögliche sensible Oberflächen, z. B. Login- und Admin-Seiten, VPN-Portale, Jenkins, phpMyAdmin, Swagger UI
 - Scanner vermutlich gesperrt (siehe unten)
+
+Gleiche Befunde werden zu einem Eintrag mit allen betroffenen Adressen zusammengefasst. Ein Zertifikat, das für viele Hostnamen gilt, erscheint also nur einmal. In der JSON-Datei steht die vollständige Liste unter `targets`.
 
 ## Last und Sperren
 
@@ -121,7 +125,7 @@ Wichtige Spalten in `*_services.csv`:
 | `normal` | 100 | 4 | 5 min |
 | `schnell` | unbegrenzt | 50 | 2 min |
 
-Dazu kommen pro Lauf etwa 2–5 Minuten für Archive, DNS und HTTP-Abrufe. Je Hostname sendet das Tool nur `GET /`, ohne Pfade durchzuprobieren oder Logins zu versuchen. Am Ende zeigt es, wie viele Verbindungen es auf den untersuchten Systemen erzeugt hat.
+Dazu kommen pro Lauf etwa 2–5 Minuten für Archive, DNS und HTTP-Abrufe. DNS-Anfragen werden auf 20 pro Sekunde je Nameserver begrenzt, damit dessen Rate Limiting nicht greift. Bleibt eine Antwort trotzdem aus, wiederholt das Tool die Anfrage nach einer kurzen Pause. Namen, die danach noch ohne Antwort sind, versucht es nach 10 Sekunden ein weiteres Mal. In der JSON-Datei stehen unter `load` die Zahl der DNS-Anfragen und der Wiederholungen. Je Hostname sendet das Tool nur `GET /`, ohne Pfade durchzuprobieren oder Logins zu versuchen. Am Ende zeigt es, wie viele Verbindungen es auf den untersuchten Systemen erzeugt hat.
 
 **Sperr-Erkennung:** Das Tool merkt sich pro IP-Adresse einen Port, der nachweislich offen war. Nach dem Portscan und nach jeder Runde HTTP-Abrufe prüft es diesen Port erneut. Antwortet er nicht mehr, hat vermutlich fail2ban, ein IPS oder eine WAF den Scanner gesperrt. Dann warnt das Tool und markiert die Ergebnisse dieser IP-Adresse als unvollständig.
 

@@ -47,7 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.2"
+VERSION = "3.3"
 
 # ============================================================== Einstellungen
 
@@ -127,6 +127,9 @@ PROFILES = {
 
 MAX_ROUNDS = 5            # Entdeckungsrunden (neue Namen aus Zertifikaten/Redirects)
 DNS_TIMEOUT = 3.0         # Sekunden je DNS-Anfrage
+DNS_RATE_PER_SERVER = 20  # Anfragen/s je Nameserver – bleibt unter üblichen Rate-Limits (RRL)
+DNS_ROUNDS = 3            # Versuche je Frage (mit Pause), falls Antworten verloren gehen
+CERT_WARN_DAYS = 30       # Warnung, wenn ein Zertifikat in weniger Tagen abläuft
 SOURCE_TIMEOUT = 300      # Sekunden je passiver Quelle und Domain
 MAX_ADDRESSES = 65536     # größere Netze bitte aufteilen oder masscan/naabu vorschalten
 CACHE_DIR = os.path.expanduser("~/.cache/webinventar")
@@ -449,6 +452,28 @@ def extract_names(text, domain):
 
 # ============================================================== DNS ohne fremde Resolver
 
+# ============================================================== Drosselung
+
+class RateLimiter:
+    """Begrenzt neue Verbindungen pro Sekunde (über alle Ziele)."""
+
+    def __init__(self, rate):
+        self.interval = 1.0 / rate if rate else 0.0
+        self.next = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        if not self.interval:
+            return
+        async with self.lock:
+            now = time.monotonic()
+            self.next = max(self.next, now)
+            delay = self.next - now
+            self.next += self.interval
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
 # DNS-Protokoll nach RFC 1035, nur mit der Standardbibliothek. Unterstützt werden die
 # Record-Typen, die das Skript braucht; alles andere wird beim Lesen übersprungen.
 
@@ -669,26 +694,43 @@ class IterativeResolver:
         self.no_cut = set()        # Namen ohne eigene Zone (keine Delegation)
         self.cache = {}            # (name, typ) -> Ergebnis
         self.sem = asyncio.Semaphore(100)
+        self.per_server = {}       # Nameserver-IP -> (Semaphore, RateLimiter)
         self.queries = 0
+        self.retries = 0
+
+    async def _query(self, ip, qname, qtype):
+        """Eine Anfrage an einen Server, gedrosselt je Server. Gekürzte Antworten werden
+        per TCP wiederholt, Server ohne EDNS-Unterstützung ohne EDNS gefragt."""
+        if ip not in self.per_server:
+            self.per_server[ip] = (asyncio.Semaphore(10), RateLimiter(DNS_RATE_PER_SERVER))
+        slot, rate = self.per_server[ip]
+        async with self.sem, slot:
+            await rate.wait()
+            self.queries += 1
+            edns = ip not in self.no_edns
+            m = await udp_query(ip, qname, qtype, edns)
+            if m.rcode == FORMERR and edns:
+                self.no_edns.add(ip)
+                m = await udp_query(ip, qname, qtype, edns=False)
+            if m.flags & FLAG_TC:
+                m = await tcp_query(ip, qname, qtype, ip not in self.no_edns)
+            return m
 
     async def ask(self, servers, qname, qtype):
         """Eine Frage an bis zu drei Server der Zone; erste brauchbare Antwort zählt.
-        Gekürzte Antworten werden per TCP wiederholt, Server ohne EDNS ohne EDNS gefragt."""
-        for ip in random.sample(servers, min(3, len(servers))):
-            try:
-                async with self.sem:
-                    self.queries += 1
-                    edns = ip not in self.no_edns
-                    m = await udp_query(ip, qname, qtype, edns)
-                    if m.rcode == FORMERR and edns:
-                        self.no_edns.add(ip)
-                        m = await udp_query(ip, qname, qtype, edns=False)
-                    if m.flags & FLAG_TC:
-                        m = await tcp_query(ip, qname, qtype, ip not in self.no_edns)
+        Bleibt alles ohne Antwort (Paketverlust, Rate Limiting), wird es nach einer
+        kurzen Pause wiederholt."""
+        for attempt in range(DNS_ROUNDS):
+            if attempt:
+                self.retries += 1
+                await asyncio.sleep(2 * attempt + random.random())
+            for ip in random.sample(servers, min(3, len(servers))):
+                try:
+                    m = await self._query(ip, qname, qtype)
+                except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    continue
                 if m.rcode in (NOERROR, NXDOMAIN):
                     return m
-            except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
-                continue
         return None
 
     @staticmethod
@@ -785,30 +827,9 @@ class IterativeResolver:
                 continue                         # Verweis auf tiefere Zone: dort erneut fragen
             result = ("nodata", [], chain)
             break
-        self.cache[key] = result
+        if result[0] != "fail":                  # Fehler nicht merken: später neu versuchen
+            self.cache[key] = result
         return result
-
-
-# ============================================================== Drosselung
-
-class RateLimiter:
-    """Begrenzt neue Verbindungen pro Sekunde (über alle Ziele)."""
-
-    def __init__(self, rate):
-        self.interval = 1.0 / rate if rate else 0.0
-        self.next = 0.0
-        self.lock = asyncio.Lock()
-
-    async def wait(self):
-        if not self.interval:
-            return
-        async with self.lock:
-            now = time.monotonic()
-            self.next = max(self.next, now)
-            delay = self.next - now
-            self.next += self.interval
-        if delay > 0:
-            await asyncio.sleep(delay)
 
 
 # ============================================================== Inventar
@@ -835,7 +856,7 @@ class Inventory:
         self.scheme = {}         # (IP, Port) -> https | http | tls-non-http | non-http
         self.probed = set()      # (IP, Port, Hostname) bereits abgerufen
         self.services = []       # Ergebniszeilen
-        self.findings = []       # Auffälligkeiten
+        self.findings = {}       # (Art, Gruppe) -> {type, detail, targets}
         self.source_stats = {}   # Quelle -> {names, new, error}
 
         # Last und Sperr-Erkennung
@@ -886,8 +907,12 @@ class Inventory:
             self.ips[ip] = {"ip": ip, "in_net": self.in_net(ip), "ptr": "", "hostnames": set()}
         return self.ips[ip]
 
-    def finding(self, kind, target, detail):
-        self.findings.append({"type": kind, "target": target, "detail": detail})
+    def finding(self, kind, target, detail, group=None):
+        """Auffälligkeit merken. Gleiche Art und Gruppe (standardmäßig die Beschreibung, bei
+        Zertifikaten das Zertifikat) werden zu einem Eintrag mit mehreren Zielen zusammengefasst."""
+        fd = self.findings.setdefault((kind, group or detail), {"type": kind, "detail": detail, "targets": []})
+        if target not in fd["targets"]:
+            fd["targets"].append(target)
 
     def live_hosts(self):
         return [h for h in self.hosts.values() if h["status"].startswith("resolved")]
@@ -1039,6 +1064,14 @@ class Inventory:
                 # Nur geratene Namen verwerfen; Namen aus CT/Archiven bleiben, markiert
                 h["status"] = "wildcard" if h["sources"] == {"wortliste"} else "resolved (wildcard)"
         await asyncio.gather(*[one(h) for h in pending])
+        failed = [h for h in pending if h["status"] == "dns-fehler"]
+        if failed:                                   # zweiter Anlauf nach kurzer Pause
+            log(f"{len(failed)} Namen ohne DNS-Antwort – neuer Versuch in 10 s …")
+            await asyncio.sleep(10)
+            await asyncio.gather(*[one(h) for h in failed])
+            still = sum(h["status"] == "dns-fehler" for h in failed)
+            if still:
+                log(f"{still} Namen weiterhin ohne DNS-Antwort (Nameserver überlastet oder nicht erreichbar)")
         return len(pending)
 
     # ---------------------------------------------------------- Phase 3: Ports
@@ -1374,28 +1407,47 @@ class Inventory:
         self.analyse()
 
     def analyse(self):
-        """Auffälligkeiten aus den Ergebnissen ableiten."""
+        """Auffälligkeiten aus den Ergebnissen ableiten. Gleiche Befunde (gleiche Art und
+        Beschreibung, bzw. dasselbe Zertifikat) werden zu einem Eintrag zusammengefasst."""
         defaults = {(r["ip"], r["port"]): (r.get("status"), r.get("body_hash"))
                     for r in self.services if not r["hostname"]}
+        now = time.time()
         for r in self.services:
-            sig = (r.get("status"), r.get("body_hash"))
-            if r["hostname"] and r.get("body_hash") and defaults.get((r["ip"], r["port"])) == sig:
+            host = r["hostname"] or r["ip"]      # für Zertifikats-Befunde
+            url, status, tls = r["url"], r.get("status"), r.get("scheme") == "https"
+            if r["hostname"] and r.get("body_hash") and defaults.get((r["ip"], r["port"])) == \
+                    (status, r.get("body_hash")):
                 r["notes"] = "gleiche Antwort wie ohne Hostname"
-            if r.get("scheme") == "http" and r.get("status") == 200:
-                self.finding("HTTP ohne Umleitung", r["url"], "unverschlüsselt, keine Weiterleitung auf HTTPS")
+            if r.get("scheme") == "http" and status == 200:
+                self.finding("HTTP ohne Umleitung", url, "unverschlüsselt, keine Weiterleitung auf HTTPS")
+            # Umleitung von HTTPS auf HTTP (erster Schritt oder Ziel der Kette)
+            if tls:
+                first = urllib.parse.urljoin(url, r.get("location") or "")
+                if (r.get("location") and first.startswith("http://")) or \
+                        str(r.get("final_url", "")).startswith("http://"):
+                    target = first if first.startswith("http://") else r["final_url"]
+                    self.finding("Umleitung von HTTPS auf HTTP", url, f"leitet auf {target} um")
+            # Zertifikate: gruppiert je Zertifikat, damit ein gemeinsames Zertifikat nur einmal erscheint
             if r.get("cert_not_after"):
+                cert = f"{r.get('cert_cn', '')} (gültig bis {r['cert_not_after']})"
                 try:
-                    if ssl.cert_time_to_seconds(r["cert_not_after"]) < time.time():
-                        self.finding("Zertifikat abgelaufen", r["url"], r["cert_not_after"])
+                    days = (ssl.cert_time_to_seconds(r["cert_not_after"]) - now) / 86400
                 except ValueError:
-                    pass
+                    days = None
+                if days is not None and days < 0:
+                    self.finding("Zertifikat abgelaufen", host, cert, cert)
+                elif days is not None and days < CERT_WARN_DAYS:
+                    self.finding("Zertifikat läuft bald ab", host, f"{cert}, noch {int(days)} Tage", cert)
             if str(r.get("cert_valid", "")).startswith("nein"):
-                self.finding("Zertifikat ungültig", r["url"], r["cert_valid"][6:])
+                self.finding("Zertifikat ungültig", url, r["cert_valid"][6:])
+            if tls and r["hostname"] and r.get("cert_valid") == "ja" and isinstance(status, int) \
+                    and 200 <= status < 400 and not r.get("hsts"):
+                self.finding("HTTPS ohne HSTS", url, "kein Strict-Transport-Security-Header")
             if r.get("tls_version") in ("SSLv3", "TLSv1", "TLSv1.1"):
-                self.finding("Veraltetes TLS", r["url"], r["tls_version"])
+                self.finding("Veraltetes TLS", url, r["tls_version"])
             text = f"{r.get('title', '')} {r.get('final_title', '')} {r.get('tech', '')}".strip()
-            if (r.get("status") in (200, 401, 403) or r.get("final_status") == 200) and SENSITIVE.search(text):
-                self.finding("Sensible Oberfläche?", r["url"], text[:120])
+            if (status in (200, 401, 403) or r.get("final_status") == 200) and SENSITIVE.search(text):
+                self.finding("Sensible Oberfläche?", url, text[:120])
 
     # ---------------------------------------------------------- Ausgabe
     def write(self, prefix):
@@ -1435,8 +1487,10 @@ class Inventory:
         with open(f"{prefix}.json", "w", encoding="utf-8") as f:
             json.dump({"generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "version": VERSION,
                        "scope": {"domains": self.domains, "nets": [str(n) for n in self.nets]},
-                       "load": {**self.stats, "dns_queries": self.dns.queries},
-                       "sources": self.source_stats, "findings": self.findings, "services": rows,
+                       "load": {**self.stats, "dns_queries": self.dns.queries,
+                                "dns_retries": self.dns.retries},
+                       "sources": self.source_stats, "findings": list(self.findings.values()),
+                       "services": rows,
                        "hosts": [{**h, "sources": sorted(h["sources"])} for h in hosts],
                        "ips": [{**i, "hostnames": sorted(i["hostnames"]),
                                 "open_ports": sorted(self.open_ports.get(i["ip"], []))} for i in ips]},
@@ -1471,11 +1525,10 @@ class Inventory:
                   "erneut prüfen (-n IP).")
         if self.findings:
             print(f"\nAuffälligkeiten ({len(self.findings)}):")
-            seen = set()
-            for fd in self.findings:
-                if (fd["type"], fd["target"]) not in seen:
-                    seen.add((fd["type"], fd["target"]))
-                    print(f"  [{fd['type']}] {fd['target']} – {fd['detail']}")
+            for fd in self.findings.values():
+                t = fd["targets"]
+                more = f" … und {len(t) - 5} weitere (siehe JSON)" if len(t) > 5 else ""
+                print(f"  [{fd['type']}] {fd['detail']}\n      {', '.join(t[:5])}{more}")
 
 
 def dechunk(body):
