@@ -25,7 +25,7 @@ Ablauf:
      folgen, Technologien erkennen (Wappalyzer-Fingerprints wie bei httpx).
   5. Wiederholung, bis keine neuen Hostnamen mehr auftauchen (max. 5 Runden).
 
-Abhängigkeit: dnspython (pip install dnspython)
+Keine Abhängigkeiten außer der Python-Standardbibliothek (ab Python 3.9).
 Nur gegen Netze und Domains einsetzen, für die ihr berechtigt seid.
 """
 import argparse
@@ -34,6 +34,7 @@ import csv
 import hashlib
 import ipaddress
 import json
+import struct
 import os
 import random
 import re
@@ -46,19 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-try:
-    import dns.asyncquery
-    import dns.flags
-    import dns.message
-    import dns.query
-    import dns.rcode
-    import dns.rdatatype
-    import dns.reversename
-    import dns.zone
-except ImportError:
-    sys.exit("Fehlt: dnspython  ->  pip install dnspython")
-
-VERSION = "3.1"
+VERSION = "3.2"
 
 # ============================================================== Einstellungen
 
@@ -460,8 +449,207 @@ def extract_names(text, domain):
 
 # ============================================================== DNS ohne fremde Resolver
 
+# DNS-Protokoll nach RFC 1035, nur mit der Standardbibliothek. Unterstützt werden die
+# Record-Typen, die das Skript braucht; alles andere wird beim Lesen übersprungen.
+
+TYPES = {"A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "PTR": 12, "MX": 15, "TXT": 16,
+         "AAAA": 28, "SRV": 33, "OPT": 41, "AXFR": 252}
+NOERROR, FORMERR, NXDOMAIN = 0, 1, 3
+FLAG_AA, FLAG_TC = 0x0400, 0x0200
+EDNS_SIZE = 1232          # empfohlene UDP-Größe (DNS Flag Day 2020)
+
+
 class DNSFail(Exception):
     pass
+
+
+class RR:
+    """Ein Record: Name (klein, ohne Punkt am Ende), Typ als Zahl und Wert als Text.
+    Wert je Typ: A/AAAA Adresse, NS/CNAME/PTR Zielname, MX Mailserver, SRV Zielhost,
+    SOA primärer Nameserver, TXT Text."""
+    __slots__ = ("name", "type", "value")
+
+    def __init__(self, name, rtype, value):
+        self.name, self.type, self.value = name, rtype, value
+
+
+class Message:
+    __slots__ = ("id", "flags", "rcode", "question", "answer", "authority", "additional")
+
+
+def encode_name(name):
+    out = b""
+    for label in filter(None, name.rstrip(".").split(".")):
+        raw = label.encode("idna") if not label.isascii() else label.encode()
+        if len(raw) > 63:
+            raise ValueError("Label zu lang")
+        out += bytes([len(raw)]) + raw
+    return out + b"\0"
+
+
+def build_query(qname, qtype, edns=True):
+    """Anfrage ohne Rekursionswunsch (RD=0), mit zufälliger ID und optional EDNS."""
+    qid = random.getrandbits(16)
+    msg = struct.pack("!HHHHHH", qid, 0, 1, 0, 0, 1 if edns else 0)
+    msg += encode_name(qname) + struct.pack("!HH", TYPES[qtype], 1)
+    if edns:
+        msg += b"\0" + struct.pack("!HHIH", TYPES["OPT"], EDNS_SIZE, 0, 0)
+    return qid, msg
+
+
+def read_name(buf, off):
+    """Namen lesen, inkl. Komprimierung. Zeiger dürfen nur rückwärts zeigen; damit sind
+    Endlosschleifen durch manipulierte Antworten ausgeschlossen."""
+    labels, end, start = [], None, off
+    while True:
+        if off >= len(buf):
+            raise ValueError("Name abgeschnitten")
+        n = buf[off]
+        if n & 0xC0 == 0xC0:
+            if off + 1 >= len(buf):
+                raise ValueError("Zeiger abgeschnitten")
+            ptr = ((n & 0x3F) << 8) | buf[off + 1]
+            if ptr >= start:
+                raise ValueError("ungültiger Zeiger")
+            end = off + 2 if end is None else end
+            off = start = ptr
+            continue
+        if n & 0xC0:
+            raise ValueError("unbekannter Label-Typ")
+        off += 1
+        if n == 0:
+            break
+        labels.append(buf[off:off + n].decode("ascii", "replace").lower())
+        off += n
+        if sum(len(x) + 1 for x in labels) > 255:
+            raise ValueError("Name zu lang")
+    return ".".join(labels), (end if end is not None else off)
+
+
+def parse_message(buf):
+    """Antwort lesen. Wirft ValueError bei kaputten Daten."""
+    if len(buf) < 12:
+        raise ValueError("zu kurz")
+    m = Message()
+    m.id, m.flags, qd, an, ns, ar = struct.unpack("!HHHHHH", buf[:12])
+    m.rcode = m.flags & 0x0F
+    off, m.question = 12, None
+    for _ in range(qd):
+        name, off = read_name(buf, off)
+        if off + 4 > len(buf):
+            raise ValueError("Frage abgeschnitten")
+        m.question = (name, struct.unpack("!H", buf[off:off + 2])[0])
+        off += 4
+    sections = []
+    for count in (an, ns, ar):
+        records = []
+        for _ in range(count):
+            name, off = read_name(buf, off)
+            if off + 10 > len(buf):
+                raise ValueError("Record abgeschnitten")
+            rtype, _, _, rdlen = struct.unpack("!HHIH", buf[off:off + 10])
+            off += 10
+            if off + rdlen > len(buf):
+                raise ValueError("Daten abgeschnitten")
+            rd, value = buf[off:off + rdlen], None
+            if rtype == 1 and rdlen == 4:
+                value = str(ipaddress.IPv4Address(rd))
+            elif rtype == 28 and rdlen == 16:
+                value = str(ipaddress.IPv6Address(rd))
+            elif rtype in (2, 5, 12, 6):          # NS, CNAME, PTR, SOA (primärer Nameserver)
+                value = read_name(buf, off)[0]
+            elif rtype == 15 and rdlen > 2:       # MX: Priorität, Name
+                value = read_name(buf, off + 2)[0]
+            elif rtype == 33 and rdlen > 6:       # SRV: Priorität, Gewicht, Port, Name
+                value = read_name(buf, off + 6)[0]
+            elif rtype == 16:                     # TXT: Folge von Längen-Strings
+                parts, i = [], 0
+                while i < rdlen:
+                    parts.append(rd[i + 1:i + 1 + rd[i]])
+                    i += 1 + rd[i]
+                value = b"".join(parts).decode("utf-8", "replace")
+            if value is not None:
+                records.append(RR(name, rtype, value))
+            off += rdlen
+        sections.append(records)
+    m.answer, m.authority, m.additional = sections
+    return m
+
+
+def matches(m, qid, qname, qtype):
+    """Gehört die Antwort zur Anfrage? (Schutz vor verirrten oder gefälschten Paketen)"""
+    return m.id == qid and m.question == (qname.rstrip(".").lower(), TYPES[qtype])
+
+
+async def udp_query(ip, qname, qtype, edns=True):
+    qid, data = build_query(qname, qtype, edns)
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    class Proto(asyncio.DatagramProtocol):
+        def datagram_received(self, packet, addr):
+            try:
+                m = parse_message(packet)
+            except ValueError:
+                return
+            if matches(m, qid, qname, qtype) and not fut.done():
+                fut.set_result(m)
+
+    # "verbundener" UDP-Socket: das Betriebssystem nimmt nur Pakete dieser IP an;
+    # der Quellport ist zufällig
+    transport, _ = await loop.create_datagram_endpoint(Proto, remote_addr=(ip, 53))
+    try:
+        transport.sendto(data)
+        return await asyncio.wait_for(fut, DNS_TIMEOUT)
+    finally:
+        transport.close()
+
+
+async def tcp_read(reader):
+    size = struct.unpack("!H", await reader.readexactly(2))[0]
+    return await reader.readexactly(size)
+
+
+async def tcp_query(ip, qname, qtype, edns=True):
+    qid, data = build_query(qname, qtype, edns)
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, 53), DNS_TIMEOUT)
+    try:
+        writer.write(struct.pack("!H", len(data)) + data)
+        await writer.drain()
+        m = parse_message(await asyncio.wait_for(tcp_read(reader), DNS_TIMEOUT))
+        if not matches(m, qid, qname, qtype):
+            raise ValueError("fremde Antwort")
+        return m
+    finally:
+        writer.close()
+
+
+async def axfr(ip, zone):
+    """Zonentransfer versuchen. Liefert die Namen der Zone oder None, wenn abgelehnt."""
+    qid, data = build_query(zone, "AXFR", edns=False)
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, 53), 8)
+    except (OSError, asyncio.TimeoutError):
+        return None
+    names, soa_seen = set(), 0
+    try:
+        writer.write(struct.pack("!H", len(data)) + data)
+        await writer.drain()
+        deadline = time.monotonic() + 30
+        while soa_seen < 2 and time.monotonic() < deadline:
+            m = parse_message(await asyncio.wait_for(tcp_read(reader), 8))
+            if m.id != qid or m.rcode != NOERROR or (not names and not m.answer):
+                return None
+            for rr in m.answer:
+                names.add(rr.name)
+                soa_seen += rr.type == TYPES["SOA"]
+            if soa_seen == 0:
+                return None                         # erste Antwort muss mit SOA beginnen
+    except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+        return sorted(names) if soa_seen >= 2 else None
+    finally:
+        writer.close()
+    return sorted(names) if soa_seen >= 2 else None
 
 
 class IterativeResolver:
@@ -471,99 +659,99 @@ class IterativeResolver:
     nächsten Label (z. B. die .de-Server nur nach "firma.de", nie nach
     "intern.firma.de"). Vollständige Namen erreichen nur die zuständigen Server.
     Delegationen werden zwischengespeichert, damit jede Zone nur einmal gesucht wird.
+    Namen werden intern klein und ohne abschließenden Punkt geführt; "" ist die Wurzel.
     """
 
-    def __init__(self, roots=None):
-        self.zones = {".": list(roots or ROOT_SERVERS)}  # Zone -> Nameserver-IPs
+    def __init__(self, roots=None, own_domains=()):
+        self.zones = {"": list(roots or ROOT_SERVERS)}   # Zone -> Nameserver-IPs
+        self.own = tuple(own_domains)  # eigene Domains: nur dort sind Ausweichanfragen erlaubt
+        self.no_edns = set()       # Server, die EDNS ablehnen
         self.no_cut = set()        # Namen ohne eigene Zone (keine Delegation)
         self.cache = {}            # (name, typ) -> Ergebnis
         self.sem = asyncio.Semaphore(100)
         self.queries = 0
 
-    async def _ask(self, servers, qname, rtype):
-        """Eine Frage an bis zu drei Server der Zone; erste brauchbare Antwort zählt."""
-        q = dns.message.make_query(qname, rtype)
-        q.flags &= ~dns.flags.RD    # keine Rekursion anfordern
+    async def ask(self, servers, qname, qtype):
+        """Eine Frage an bis zu drei Server der Zone; erste brauchbare Antwort zählt.
+        Gekürzte Antworten werden per TCP wiederholt, Server ohne EDNS ohne EDNS gefragt."""
         for ip in random.sample(servers, min(3, len(servers))):
             try:
                 async with self.sem:
                     self.queries += 1
-                    r = await dns.asyncquery.udp(q, ip, timeout=DNS_TIMEOUT)
-                    if r.flags & dns.flags.TC:
-                        r = await dns.asyncquery.tcp(q, ip, timeout=DNS_TIMEOUT)
-                if r.rcode() in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
-                    return r
-            except Exception:  # noqa: BLE001  (Timeout, Verbindungsfehler)
+                    edns = ip not in self.no_edns
+                    m = await udp_query(ip, qname, qtype, edns)
+                    if m.rcode == FORMERR and edns:
+                        self.no_edns.add(ip)
+                        m = await udp_query(ip, qname, qtype, edns=False)
+                    if m.flags & FLAG_TC:
+                        m = await tcp_query(ip, qname, qtype, ip not in self.no_edns)
+                if m.rcode in (NOERROR, NXDOMAIN):
+                    return m
+            except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
                 continue
         return None
 
-    async def _ns_addresses(self, response, ns_names, depth):
-        """IP-Adressen der Nameserver: Glue-Records oder eigene Auflösung."""
-        glue = {}
-        for rrset in response.additional:
-            if rrset.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
-                glue.setdefault(rrset.name.to_text().lower(), []).extend(r.address for r in rrset)
-        ips = [ip for n in ns_names for ip in glue.get(n, []) if ":" not in ip]
+    @staticmethod
+    def _records(section, owner, qtype):
+        t = TYPES[qtype]
+        return [rr for rr in section if rr.type == t and rr.name == owner]
+
+    async def _ns_addresses(self, m, ns_names, depth):
+        """IPv4-Adressen der Nameserver: Glue-Records oder eigene Auflösung."""
+        ips = [rr.value for rr in m.additional if rr.type == TYPES["A"] and rr.name in ns_names]
         if not ips and depth < 4:
             for n in ns_names[:4]:
                 st, recs, _ = await self.resolve(n, "A", depth + 1)
-                ips += [r.address for r in recs] if st == "ok" else []
+                ips += [r.value for r in recs] if st == "ok" else []
                 if len(ips) >= 2:
                     break
         return ips
 
-    @staticmethod
-    def _records(section, owner, rdtype):
-        return [rr for rrset in section if rrset.rdtype == rdtype
-                and rrset.name.to_text().lower().rstrip(".") == owner for rr in rrset]
-
-    async def _learn_delegation(self, response, depth):
+    async def _learn_delegation(self, m, depth):
         """Verweis (Referral) auf zuständige Nameserver einer tieferen Zone merken."""
-        for rrset in response.authority:
-            if rrset.rdtype == dns.rdatatype.NS:
-                zone = rrset.name.to_text().lower()
-                if zone not in self.zones:
-                    ips = await self._ns_addresses(response, [r.target.to_text().lower() for r in rrset], depth)
-                    if ips:
-                        self.zones[zone] = ips
-                        return True
+        for zone in {rr.name for rr in m.authority if rr.type == TYPES["NS"]} - set(self.zones):
+            ns = [rr.value for rr in self._records(m.authority, zone, "NS")]
+            ips = await self._ns_addresses(m, ns, depth)
+            if ips:
+                self.zones[zone] = ips
+                return True
         return False
 
     async def servers_for(self, name, depth=0):
         """Zuständige Nameserver für name suchen (von der Wurzel abwärts, je Label eine Frage).
         Liefert None, wenn ein übergeordneter Name nicht existiert."""
-        labels = name.rstrip(".").split(".")
-        servers = self.zones["."]
+        labels = name.split(".")
+        zone, servers = "", self.zones[""]
         for i in range(len(labels) - 1, -1, -1):
-            child = ".".join(labels[i:]) + "."
+            child = ".".join(labels[i:])
             if child in self.zones:
-                servers = self.zones[child]
+                zone, servers = child, self.zones[child]
                 continue
             if child in self.no_cut:
                 continue
-            r = await self._ask(servers, child, "NS")      # nur nach dem nächsten Label fragen
-            if r is None:
+            m = await self.ask(servers, child, "NS")          # nur nach dem nächsten Label fragen
+            if m is None:
                 raise DNSFail(child)
-            if r.rcode() == dns.rcode.NXDOMAIN:
+            if m.rcode == NXDOMAIN:
                 # Manche Server melden NXDOMAIN für leere Zwischenebenen (RFC 8020 nicht
-                # umgesetzt). Dann den vollständigen Namen bei diesen Servern stellen.
-                return servers if i > 0 else None
-            ns = [rr.target.to_text().lower() for sec in (r.answer, r.authority) for rrset in sec
-                  if rrset.rdtype == dns.rdatatype.NS and rrset.name.to_text().lower() == child.lower()
-                  for rr in rrset]
-            ips = await self._ns_addresses(r, ns, depth) if ns else []
+                # umgesetzt). Nur bei den Servern der eigenen Domains wird dann der
+                # vollständige Name gestellt; Root, TLDs und fremde Server erfahren ihn nie.
+                own = any(zone == d or zone.endswith("." + d) for d in self.own)
+                return servers if i > 0 and own else None
+            ns = [rr.value for rr in self._records(m.answer + m.authority, child, "NS")]
+            ips = await self._ns_addresses(m, ns, depth) if ns else []
             if ips:
                 self.zones[child] = servers = ips
+                zone = child
             else:
                 self.no_cut.add(child)                       # keine eigene Zone
         return servers
 
-    async def resolve(self, name, rtype, depth=0):
+    async def resolve(self, name, qtype, depth=0):
         """Ergebnis: (status, records, cname_kette); status ist ok | nxdomain | nodata | fail."""
-        key = (name.lower().rstrip("."), rtype)
+        key = (name.lower().rstrip("."), qtype)
         if key in self.cache:
             return self.cache[key]
-        want = dns.rdatatype.from_text(rtype)
         chain, cur, result = [], key[0], ("fail", [], [])
         for _ in range(10):                     # CNAME-Ziele und Verweise in andere Zonen
             try:
@@ -573,17 +761,16 @@ class IterativeResolver:
             if servers is None:
                 result = ("nxdomain", [], chain)
                 break
-            r = await self._ask(servers, cur + ".", rtype)
-            if r is None:
+            m = await self.ask(servers, cur, qtype)
+            if m is None:
                 break
-            owner, recs = cur, []                # CNAME-Kette innerhalb der Antwort verfolgen
+            owner, recs = cur, []               # CNAME-Kette innerhalb der Antwort verfolgen
             while len(chain) < 10:
-                recs = self._records(r.answer, owner, want)
-                cname = [] if want == dns.rdatatype.CNAME else \
-                    self._records(r.answer, owner, dns.rdatatype.CNAME)
+                recs = self._records(m.answer, owner, qtype)
+                cname = [] if qtype == "CNAME" else self._records(m.answer, owner, "CNAME")
                 if recs or not cname:
                     break
-                owner = cname[0].target.to_text().lower().rstrip(".")
+                owner = cname[0].value
                 chain.append(owner)
             if recs:
                 result = ("ok", recs, chain)
@@ -591,10 +778,10 @@ class IterativeResolver:
             if owner != cur:                     # CNAME-Ziel liegt woanders: dort weiterfragen
                 cur = owner
                 continue
-            if r.rcode() == dns.rcode.NXDOMAIN:
+            if m.rcode == NXDOMAIN:
                 result = ("nxdomain", [], chain)
                 break
-            if not r.answer and not (r.flags & dns.flags.AA) and await self._learn_delegation(r, depth):
+            if not m.answer and not (m.flags & FLAG_AA) and await self._learn_delegation(m, depth):
                 continue                         # Verweis auf tiefere Zone: dort erneut fragen
             result = ("nodata", [], chain)
             break
@@ -636,7 +823,7 @@ class Inventory:
         self.wordlist = wordlist
         self.use_tech = tech
         self.overrides = overrides or {}       # Name -> [IP]  (nur für Tests/Sonderfälle)
-        self.dns = IterativeResolver(roots)
+        self.dns = IterativeResolver(roots, self.domains)
         self.tech = TechDetector()
 
         self.hosts = {}          # Name -> {status, a, aaaa, cname, sources, net_only}
@@ -738,19 +925,15 @@ class Inventory:
     async def collect_dns(self):
         """NS, MX, SOA, TXT (SPF), SRV und Zonentransfer-Versuch je Domain."""
         for d in self.domains:
-            for rr in await self.q(d, "NS"):
-                self.add_host(rr.target.to_text(), "dns")
-            for rr in await self.q(d, "MX"):
-                self.add_host(rr.exchange.to_text(), "dns")
-            for rr in await self.q(d, "SOA"):
-                self.add_host(rr.mname.to_text(), "dns")
+            for qtype in ("NS", "MX", "SOA"):
+                for rr in await self.q(d, qtype):
+                    self.add_host(rr.value, "dns")
             for rr in await self.q(d, "TXT"):
-                txt = b"".join(rr.strings).decode("utf-8", "replace")
-                for m in re.findall(r"(?:a|mx|include|ptr|exists)[:=]([a-z0-9.\-_]+)", txt, re.I):
+                for m in re.findall(r"(?:a|mx|include|ptr|exists)[:=]([a-z0-9.\-_]+)", rr.value, re.I):
                     self.add_host(m, "dns")
             for recs in await asyncio.gather(*[self.q(f"{s}.{d}", "SRV") for s in SRV_NAMES]):
                 for rr in recs:
-                    self.add_host(rr.target.to_text(), "dns")
+                    self.add_host(rr.value, "dns")
             await self.try_axfr(d)
 
     async def try_axfr(self, domain):
@@ -760,12 +943,9 @@ class Inventory:
         except DNSFail:
             return
         for ip in servers or []:
-            try:
-                zone = await asyncio.to_thread(
-                    lambda: dns.zone.from_xfr(dns.query.xfr(ip, domain, timeout=8, lifetime=20)))
-            except Exception:  # noqa: BLE001  (abgelehnt = gut)
-                continue
-            names = [domain if str(n) == "@" else f"{n}.{domain}" for n in zone.nodes]
+            names = await axfr(ip, domain)
+            if names is None:
+                continue                                 # abgelehnt = gut
             for n in names:
                 self.add_host(n, "axfr")
             self.finding("Zonentransfer offen", f"{domain} @ {ip}", f"{len(names)} Einträge abrufbar")
@@ -799,9 +979,9 @@ class Inventory:
 
         async def one(ip):
             async with sem:
-                recs = await self.q(dns.reversename.from_address(ip).to_text(), "PTR")
+                recs = await self.q(ipaddress.ip_address(ip).reverse_pointer, "PTR")
             if recs:
-                ptr = recs[0].target.to_text().rstrip(".")
+                ptr = recs[0].value
                 self.ipinfo(ip)["ptr"] = ptr
                 self.add_host(ptr, "ptr", foreign_ok=True)
         await asyncio.gather(*[one(ip) for ip in ips])
@@ -815,7 +995,7 @@ class Inventory:
         async with self.wildcard_lock:          # je Ebene nur einmal testen
             if parent not in self.wildcards:
                 rnd = "".join(random.choices(string.ascii_lowercase + string.digits, k=20)) + "." + parent
-                ips = {r.address for t in ("A", "AAAA") for r in await self.q(rnd, t)}
+                ips = {r.value for t in ("A", "AAAA") for r in await self.q(rnd, t)}
                 self.wildcards[parent] = ips
                 if ips:
                     log(f"Wildcard-DNS bei *.{parent}")
@@ -831,8 +1011,8 @@ class Inventory:
             return
         st4, a, chain4 = await self.dns.resolve(name, "A")
         st6, aaaa, chain6 = await self.dns.resolve(name, "AAAA")
-        h["a"] = sorted({r.address for r in a})
-        h["aaaa"] = sorted({r.address for r in aaaa})
+        h["a"] = sorted({r.value for r in a})
+        h["aaaa"] = sorted({r.value for r in aaaa})
         h["cname"] = chain4 or chain6
         if h["a"] or h["aaaa"]:
             h["status"] = "resolved"
@@ -1052,7 +1232,7 @@ class Inventory:
                 ip = (known["a"] + known["aaaa"])[0]
             elif self.in_domains(host):                           # eure Domain: selbst auflösen
                 self.add_host(host, "redirect")
-                ip = next((r.address for r in await self.q(host, "A")), None)
+                ip = next((r.value for r in await self.q(host, "A")), None)
             elif self.in_net(host):                               # IP-Adresse in eurem Netz
                 ip, host = host, None
             if not ip or not (self.in_net(ip) or (host and self.in_domains(host))):
@@ -1139,7 +1319,7 @@ class Inventory:
 
     async def run(self):
         # Eigene DNS-Auflösung braucht direkten Zugang zu UDP/TCP-Port 53 im Internet
-        if not await self.dns._ask(self.dns.zones["."], ".", "NS"):
+        if not await self.dns.ask(self.dns.zones[""], "", "NS"):
             sys.exit("Fehler: Die DNS-Root-Server sind nicht erreichbar. Das Skript löst Namen selbst auf "
                      "(ohne fremde Resolver) und braucht dafür ausgehend UDP/TCP-Port 53. Bitte von einem "
                      "Rechner mit freiem DNS-Zugang ausführen, idealerweise außerhalb eures Netzes.")

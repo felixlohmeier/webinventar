@@ -2,7 +2,7 @@
 
 Ermittelt alle öffentlich erreichbaren Webdienste der eigenen Netzbereiche und Domains. Das Ergebnis sind CSV-Dateien, in denen jede gefundene URL mit Titel, Technologie, Zertifikat und Auffälligkeiten steht.
 
-Das Tool ist ein einzelnes Python-Skript. Es braucht nur eine Zusatzbibliothek, und externe Dienste erfahren bei einem Scan nichts Neues über das untersuchte Netz.
+Das Tool ist ein einzelnes Python-Skript ohne Abhängigkeiten außer der Standardbibliothek. Externe Dienste erfahren bei einem Scan nichts Neues über das untersuchte Netz.
 
 > **Hinweis:** Das Tool nur gegen Netze und Domains einsetzen, für die eine Berechtigung vorliegt. Den Scan vorab beim zuständigen Firewall- oder Sicherheitsteam ankündigen.
 
@@ -10,7 +10,7 @@ Das Tool ist ein einzelnes Python-Skript. Es braucht nur eine Zusatzbibliothek, 
 
 | Gegenstelle | Was sie erhält | Warum das unkritisch ist |
 |---|---|---|
-| DNS-Root- und TLD-Server (z. B. `.de`) | nur den Zonennamen, z. B. `example.de` | Durch QNAME-Minimierung bekommen sie nie den vollständigen Hostnamen zu sehen. |
+| DNS-Root- und TLD-Server (z. B. `.de`) | nur den Zonennamen, z. B. `example.de` | Durch QNAME-Minimierung (RFC 9156) bekommen sie nie den vollständigen Hostnamen zu sehen, auch nicht bei nicht existierenden Namen. |
 | Die autoritativen Nameserver der eigenen Domains (bzw. der DNS-Provider) | alle Namensabfragen, auch die geratenen | Sie verwalten die Zone ohnehin. |
 | Die Nameserver der eigenen Reverse-Zonen (meist der Netzbetreiber selbst oder dessen Provider) | Rückwärtsabfragen der IP-Adressen | Sie verwalten diese Zonen ohnehin. |
 | Nameserver von Hostern, auf die CNAME-Einträge zeigen | nur deren eigene Namen, auf die die CNAMEs zeigen | Das ist die normale Abfrage, die jeder Besucher der Seite auch auslöst. |
@@ -26,8 +26,7 @@ Bewusst **nicht** verwendet:
 
 ## Voraussetzungen
 
-- Python 3.9 oder neuer
-- `dnspython`, installierbar mit `pip install dnspython`
+- Python 3.9 oder neuer, keine weiteren Pakete
 - **Ausgehender Zugriff auf Port 53 (UDP und TCP) ins Internet.** Das Skript löst Namen selbst auf, angefangen bei den Root-Servern. Ist das gesperrt, bricht es mit einer Meldung ab.
 - Für ein realistisches Ergebnis das Skript von **außerhalb** des untersuchten Netzes ausführen, etwa von einem kleinen Cloud-Server. Ein Scan von innen zeigt auch Dienste, die die Firewall nach außen gar nicht freigibt.
 
@@ -36,8 +35,9 @@ Bewusst **nicht** verwendet:
 ```bash
 git clone https://github.com/felixlohmeier/webinventar.git
 cd webinventar
-pip install dnspython
 ```
+
+Alternativ genügt es, die einzelne Datei `webinventar.py` herunterzuladen.
 
 ## Nutzung
 
