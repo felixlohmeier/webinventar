@@ -14,7 +14,7 @@ Grundsatz: Externe Dienste erfahren nichts Neues über euer Netz.
   - IP-Adressen eurer Netze werden an keinen externen Dienst geschickt.
 
 Ablauf:
-  1. Hostnamen sammeln: 7 passive Quellen, DNS-Records, Zonentransfer-Versuch,
+  1. Hostnamen sammeln: 8 passive Quellen, DNS-Records, Zonentransfer-Versuch,
      Wortliste, PTR-Records eurer Netze; später Zertifikats-SANs, Redirects und
      Namen aus Seiteninhalt und Headern der abgerufenen Antworten.
   2. Auflösen, Wildcards erkennen, verwaiste CNAMEs melden.
@@ -418,6 +418,10 @@ def http_get(url, headers=None, data=None):
 
 
 # --- Certificate Transparency
+def src_crtsh(d):
+    yield http_get(f"https://crt.sh/?q=%25.{d}&output=json")
+
+
 def src_certspotter(d):
     url = f"https://api.certspotter.com/v1/issuances?domain={d}&include_subdomains=true&expand=dns_names"
     after = None
@@ -469,7 +473,7 @@ def src_rapiddns(d):
 
 
 SOURCES = {
-    "certspotter": src_certspotter, "shodanct": src_shodanct, "crtname": src_crtname,
+    "crt.sh": src_crtsh, "certspotter": src_certspotter, "shodanct": src_shodanct, "crtname": src_crtname,
     "hackertarget": src_hackertarget, "subdomaincenter": src_subdomaincenter,
     "thc": src_thc, "rapiddns": src_rapiddns,
 }

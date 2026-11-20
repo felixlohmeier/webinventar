@@ -14,7 +14,7 @@ Das Tool ist ein einzelnes Python-Skript ohne Abhängigkeiten außer der Standar
 | Die autoritativen Nameserver der eigenen Domains (bzw. der DNS-Provider) | alle Namensabfragen, auch die geratenen | Sie verwalten die Zone ohnehin. |
 | Die Nameserver der eigenen Reverse-Zonen (meist der Netzbetreiber selbst oder dessen Provider) | Rückwärtsabfragen der IP-Adressen | Sie verwalten diese Zonen ohnehin. |
 | Nameserver von Hostern, auf die CNAME-Einträge zeigen | nur deren eigene Namen, auf die die CNAMEs zeigen | Das ist die normale Abfrage, die jeder Besucher der Seite auch auslöst. |
-| 7 öffentliche Quellen (siehe unten) | nur den Domainnamen | Die Domain ist ohnehin öffentlich bekannt. IP-Adressen und Netze werden nicht übertragen. |
+| 8 öffentliche Quellen (siehe unten) | nur den Domainnamen | Die Domain ist ohnehin öffentlich bekannt. IP-Adressen und Netze werden nicht übertragen. |
 | GitHub | Abruf der Technologie-Muster (wöchentlich) | Enthält keinen Bezug zum untersuchten Netz. Mit `--no-tech` abschaltbar. |
 | Die untersuchten Server | die eigentlichen Port- und HTTP-Prüfungen | Das ist der Zweck des Tools. |
 
@@ -32,10 +32,10 @@ Alle Quellen werden parallel abgefragt, jede höchstens 60 Sekunden lang. Was ei
 
 | Art | Quellen |
 |---|---|
-| Certificate Transparency | Certspotter, Shodan CT (ctl.shodan.io), crt.name |
+| Certificate Transparency | crt.sh, Certspotter, Shodan CT (ctl.shodan.io), crt.name |
 | Subdomain- und DNS-Datenbanken | HackerTarget, subdomain.center, THC (ip.thc.org), RapidDNS |
 
-Die Auswahl beruht auf Testläufen: Quellen, die keine oder kaum Namen lieferten oder nicht erreichbar waren, wurden entfernt. Darunter waren crt.sh, die Wayback Machine und Common Crawl.
+Die Auswahl beruht auf Testläufen: Quellen, die keine oder kaum Namen lieferten oder nicht erreichbar waren, wurden entfernt. Darunter waren die Wayback Machine und Common Crawl.
 
 Die Endpunkte entsprechen denen von [subfinder](https://github.com/projectdiscovery/subfinder). Kleinere Dienste sind gelegentlich nicht erreichbar oder begrenzen die Zahl der kostenlosen Abfragen pro Tag. Das schadet dem Lauf nicht, es fehlen dann nur deren Beiträge.
 
@@ -76,7 +76,7 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 ## Ablauf
 
 1. **Hostnamen sammeln**
-   - 7 passive Quellen: Certificate-Transparency-Logs und Subdomain-Datenbanken (siehe oben)
+   - 8 passive Quellen: Certificate-Transparency-Logs und Subdomain-Datenbanken (siehe oben)
    - DNS-Einträge: NS, MX, SOA, SPF und gängige SRV-Einträge
    - Versuch eines Zonentransfers (AXFR)
    - eingebaute Wortliste mit rund 60 typischen technischen Namen wie `www`, `mail`, `vpn`, `autodiscover` oder `ns1`; mit `-w` erweiterbar
