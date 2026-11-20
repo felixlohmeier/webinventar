@@ -35,10 +35,6 @@ Alle Quellen werden parallel abgefragt, jede höchstens 60 Sekunden lang. Was ei
 | Certificate Transparency | crt.sh, Certspotter, Shodan CT (ctl.shodan.io), crt.name |
 | Subdomain- und DNS-Datenbanken | HackerTarget, THC (ip.thc.org), RapidDNS |
 
-Die Auswahl beruht auf Testläufen: Quellen, die keine oder kaum Namen lieferten oder nicht erreichbar waren, wurden entfernt. Darunter waren die Wayback Machine und Common Crawl. subdomain.center wurde entfernt, weil die Quelle neben echten Namen viele erzeugte Varianten liefert (z. B. `teamworkk`, `www.` vor jedem Namen). In einem Testlauf existierte von 204 solchen Namen keiner.
-
-Die Endpunkte entsprechen denen von [subfinder](https://github.com/projectdiscovery/subfinder). Kleinere Dienste sind gelegentlich nicht erreichbar oder begrenzen die Zahl der kostenlosen Abfragen pro Tag. Das schadet dem Lauf nicht, es fehlen dann nur deren Beiträge.
-
 ## Voraussetzungen
 
 - Python 3.9 oder neuer, keine weiteren Pakete
