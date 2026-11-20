@@ -14,7 +14,7 @@ Das Tool ist ein einzelnes Python-Skript ohne Abhängigkeiten außer der Standar
 | Die autoritativen Nameserver der eigenen Domains (bzw. der DNS-Provider) | alle Namensabfragen, auch die geratenen | Sie verwalten die Zone ohnehin. |
 | Die Nameserver der eigenen Reverse-Zonen (meist der Netzbetreiber selbst oder dessen Provider) | Rückwärtsabfragen der IP-Adressen | Sie verwalten diese Zonen ohnehin. |
 | Nameserver von Hostern, auf die CNAME-Einträge zeigen | nur deren eigene Namen, auf die die CNAMEs zeigen | Das ist die normale Abfrage, die jeder Besucher der Seite auch auslöst. |
-| 19 öffentliche Quellen (siehe unten) | nur den Domainnamen | Die Domain ist ohnehin öffentlich bekannt. IP-Adressen und Netze werden nicht übertragen. |
+| 7 öffentliche Quellen (siehe unten) | nur den Domainnamen | Die Domain ist ohnehin öffentlich bekannt. IP-Adressen und Netze werden nicht übertragen. |
 | GitHub | Abruf der Technologie-Muster (wöchentlich) | Enthält keinen Bezug zum untersuchten Netz. Mit `--no-tech` abschaltbar. |
 | Die untersuchten Server | die eigentlichen Port- und HTTP-Prüfungen | Das ist der Zweck des Tools. |
 
@@ -28,13 +28,14 @@ Ob einzelne Quellen die angefragten Domainnamen speichern, anzeigen oder daraufh
 
 ### Passive Quellen
 
-Alle Quellen werden parallel abgefragt, jede höchstens 60 Sekunden lang. Was eine Quelle bis dahin geliefert hat, wird ausgewertet. In der Zusammenfassung steht, welche Quellen nicht erreichbar waren, welche abgebrochen wurden und wie viele neue Namen jede beigetragen hat.
+Alle Quellen werden parallel abgefragt, jede höchstens 60 Sekunden lang. Was eine Quelle bis dahin geliefert hat, wird ausgewertet. Die Zusammenfassung zeigt je Quelle, wie viele Namen sie geliefert hat und wie viele davon nur sie kannte. Außerdem steht dort, welche Quellen nicht erreichbar waren oder abgebrochen wurden.
 
 | Art | Quellen |
 |---|---|
-| Certificate Transparency | crt.sh, Certspotter, Shodan CT (ctl.shodan.io), crt.name, certificatedetails.com |
-| Web-Archive | Internet Archive (Wayback Machine), Common Crawl |
-| Subdomain- und DNS-Datenbanken | HackerTarget, Anubis, ThreatMiner, Riddler, recon.cloud, Reconeer, subdomain.center, sub.md, ScanMalware, THC (ip.thc.org), RapidDNS, Sitedossier |
+| Certificate Transparency | Certspotter, Shodan CT (ctl.shodan.io), crt.name |
+| Subdomain- und DNS-Datenbanken | HackerTarget, subdomain.center, THC (ip.thc.org), RapidDNS |
+
+Die Auswahl beruht auf Testläufen: Quellen, die keine oder kaum Namen lieferten oder nicht erreichbar waren, wurden entfernt. Darunter waren crt.sh, die Wayback Machine und Common Crawl.
 
 Die Endpunkte entsprechen denen von [subfinder](https://github.com/projectdiscovery/subfinder). Kleinere Dienste sind gelegentlich nicht erreichbar oder begrenzen die Zahl der kostenlosen Abfragen pro Tag. Das schadet dem Lauf nicht, es fehlen dann nur deren Beiträge.
 
@@ -75,10 +76,10 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 ## Ablauf
 
 1. **Hostnamen sammeln**
-   - 19 passive Quellen: Certificate-Transparency-Logs, Web-Archive und Subdomain-Datenbanken (siehe oben)
+   - 7 passive Quellen: Certificate-Transparency-Logs und Subdomain-Datenbanken (siehe oben)
    - DNS-Einträge: NS, MX, SOA, SPF und gängige SRV-Einträge
    - Versuch eines Zonentransfers (AXFR)
-   - eingebaute Wortliste mit rund 260 Namen
+   - eingebaute Wortliste mit rund 60 typischen technischen Namen wie `www`, `mail`, `vpn`, `autodiscover` oder `ns1`; mit `-w` erweiterbar
    - Rückwärtsauflösung (PTR) aller IP-Adressen der angegebenen Netze
 2. **Auflösen**
    - Namen in IP-Adressen auflösen, Wildcard-DNS auf jeder Ebene erkennen.
@@ -99,7 +100,7 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 | Datei | Inhalt |
 |---|---|
 | `*_services.csv` | eine Zeile je Webdienst (URL) bzw. offenem Port ohne HTTP |
-| `*_hosts.csv` | alle gefundenen Hostnamen mit Status, IP-Adressen, CNAME-Kette und Fundquelle (z. B. `crt.sh`, `wortliste`, `zertifikat`, `http-inhalt`) |
+| `*_hosts.csv` | alle gefundenen Hostnamen mit Status, IP-Adressen, CNAME-Kette und Fundquelle (z. B. `certspotter`, `wortliste`, `zertifikat`, `http-inhalt`) |
 | `*_ips.csv` | je IP-Adresse: PTR-Eintrag, offene Ports, Hostnamen und Sperrhinweis |
 | `*.json` | alles zusammen, dazu Statistik und Auffälligkeiten |
 
@@ -147,10 +148,10 @@ Empfehlung: Die IP-Adresse des Scan-Rechners in fail2ban (`ignoreip`), im IPS un
 ## Grenzen
 
 - **Ports:** Es wird nur die gewählte Portliste geprüft. Mit `-p all` sind alle Ports abgedeckt, das dauert aber sehr lange. Für große Netze besser vorher masscan oder naabu laufen lassen und die offenen Ports mit `-p` übergeben.
-- **Archive:** Hostnamen, die in keinem Zertifikat, keinem Archiv, keiner Wortliste und keinem DNS-Eintrag vorkommen, findet das Tool nur, wenn sie in die angegebenen Netze zeigen oder auf einer gefundenen Seite verlinkt sind. Verlinkte JavaScript-Dateien werden dabei nicht zusätzlich abgerufen. Gegenüber Tools wie subfinder fehlen die Quellen, die einen API-Schlüssel erfordern.
+- **Hostnamen:** Hostnamen, die in keinem Zertifikat, keiner Subdomain-Datenbank, keiner Wortliste und keinem DNS-Eintrag vorkommen, findet das Tool nur, wenn sie in die angegebenen Netze zeigen oder auf einer gefundenen Seite verlinkt sind. Verlinkte JavaScript-Dateien werden dabei nicht zusätzlich abgerufen. Gegenüber Tools wie subfinder fehlen die Quellen, die einen API-Schlüssel erfordern.
 - **IPv6:** Netze größer als /112 werden nicht vollständig durchsucht. Geprüft werden nur IPv6-Adressen, auf die ein DNS-Name zeigt.
 - **Technologie-Erkennung:** Erkannt wird, was sich aus Headern und HTML ablesen lässt. Was erst durch JavaScript im Browser sichtbar wird, fehlt.
-- **Gesperrte Abfragen:** Antworten einzelne Archive nicht, etwa weil crt.sh ausgelastet ist, steht das in der Zusammenfassung unter „nicht erreichbar“. Dann den Lauf später wiederholen.
+- **Gesperrte Abfragen:** Antworten einzelne Quellen nicht, etwa weil sie ausgelastet sind, steht das in der Zusammenfassung unter „nicht erreichbar“. Dann den Lauf später wiederholen.
 
 ## Regelmäßig ausführen
 

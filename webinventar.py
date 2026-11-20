@@ -9,12 +9,12 @@ Grundsatz: Externe Dienste erfahren nichts Neues über euer Netz.
     sehen nur die autoritativen Nameserver eurer Zonen, also ihr selbst bzw.
     euer DNS-Provider. Öffentliche Resolver (Google, Cloudflare, …) werden nicht
     benutzt; so landen auch geratene Namen in keiner Passive-DNS-Datenbank.
-  - Passive Quellen (CT-Logs, Web-Archive, Subdomain-Datenbanken): Diese Dienste
+  - Passive Quellen (CT-Logs, Subdomain-Datenbanken): Diese Dienste
     bekommen nur den Domainnamen, keine IP-Adressen oder Netze.
   - IP-Adressen eurer Netze werden an keinen externen Dienst geschickt.
 
 Ablauf:
-  1. Hostnamen sammeln: 19 passive Quellen, DNS-Records, Zonentransfer-Versuch,
+  1. Hostnamen sammeln: 7 passive Quellen, DNS-Records, Zonentransfer-Versuch,
      Wortliste, PTR-Records eurer Netze; später Zertifikats-SANs, Redirects und
      Namen aus Seiteninhalt und Headern der abgerufenen Antworten.
   2. Auflösen, Wildcards erkennen, verwaiste CNAMEs melden.
@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.4"
+VERSION = "3.5"
 
 # ============================================================== Einstellungen
 
@@ -152,31 +152,13 @@ SRV_NAMES = [
     "_matrix._tcp", "_matrix-fed._tcp",
 ]
 
-# Häufige Subdomain-Namen. Die Abfragen gehen nur an eure eigenen Nameserver.
+# Typische technische Subdomains. Die Abfragen gehen nur an eure eigenen Nameserver.
 WORDLIST = """
-www www1 www2 www3 web web1 web2 mail mail1 mail2 webmail email smtp imap pop
-pop3 mx mx1 mx2 owa exchange autodiscover autoconfig outlook remote vpn vpn1
-vpn2 sslvpn ssl gw gateway fw firewall portal intranet extranet internal int
-login sso auth id idp adfs sts account accounts my secure admin administrator
-panel cpanel whm plesk webdisk direct ftp sftp ftps files file share sharepoint
-cloud nextcloud owncloud drive dav backup backups git gitlab github bitbucket
-svn repo jenkins ci cd build ci-cd jira confluence wiki docs doc help support
-helpdesk ticket tickets servicedesk status monitor monitoring nagios zabbix
-grafana prometheus kibana elastic elk logs log splunk graylog api api1 api2
-rest graphql ws wss app apps application m mobile beta alpha demo test test1
-test2 testing stage staging stg dev dev1 dev2 develop development qa uat
-preprod prod production live old new legacy archive blog shop store cart
-pay payment payments billing invoice crm erp sap hr lms moodle learn
-events news media static assets cdn img images video stream download
-downloads upload uploads proxy cache lb loadbalancer edge origin ns ns1 ns2
-ns3 dns dns1 dns2 ntp time ldap ad dc radius sip voip pbx phone tel meet
-video conference teams lync skype chat matrix jitsi zoom calendar cal
-office citrix rdp rdweb remotedesktop terminal ts horizon vdi webex
-mdm intune print scan db sql mysql postgres mongo redis s3 storage minio
-registry docker k8s kubernetes rancher openshift harbor vault consul
-nexus artifactory sonar sonarqube keycloak okta survey forms forum community
-partner partners b2b customer customers kunden service services info
-mta-sts
+www www1 www2 web mail mail1 mail2 webmail smtp imap pop pop3 mx mx1 mx2
+autodiscover autoconfig mta-sts owa exchange outlook vpn vpn1 vpn2 sslvpn remote
+gateway gw fw firewall portal intranet extranet login sso auth idp adfs
+ns ns1 ns2 ns3 dns dns1 dns2 ftp sftp api cloud files git gitlab wiki status
+monitoring proxy citrix rdweb meet dev test staging
 """.split()
 
 # Titel/Technologien, bei denen ein Blick lohnt (Admin-Oberflächen, VPN-Portale, …)
@@ -398,7 +380,7 @@ class SourceTimeout(Exception):
     pass
 
 
-def http_get(url, headers=None, data=None, allow_error=False):
+def http_get(url, headers=None, data=None):
     """Abruf mit harter Frist: Auch ein langsamer Download endet spätestens zur Frist der
     Quelle; was bis dahin geladen ist, wird zurückgegeben. Wiederholt bei Überlastung."""
     deadline = getattr(_source_state, "deadline", time.monotonic() + SOURCE_TIMEOUT)
@@ -424,8 +406,6 @@ def http_get(url, headers=None, data=None, allow_error=False):
                     size += len(chunk)
                 return b"".join(chunks).decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
-            if allow_error and e.code < 500:      # manche Seiten liefern Namen auch mit 404
-                return e.read(5_000_000).decode("utf-8", "replace")
             if e.code not in (429, 500, 502, 503, 504) or attempt == 2:
                 raise
             last_error = e
@@ -438,10 +418,6 @@ def http_get(url, headers=None, data=None, allow_error=False):
 
 
 # --- Certificate Transparency
-def src_crtsh(d):
-    yield http_get(f"https://crt.sh/?q=%25.{d}&output=json")
-
-
 def src_certspotter(d):
     url = f"https://api.certspotter.com/v1/issuances?domain={d}&include_subdomains=true&expand=dns_names"
     after = None
@@ -462,60 +438,13 @@ def src_crtname(d):
     yield http_get(f"https://crt.name/v1/search?apex={d}")
 
 
-def src_digitorus(d):
-    yield http_get(f"https://certificatedetails.com/{d}", allow_error=True)
-
-
-# --- Web-Archive
-def src_wayback(d):
-    yield http_get(f"https://web.archive.org/cdx/search/cdx?url=*.{d}/*&output=txt&fl=original&collapse=urlkey")
-
-
-def src_commoncrawl(d):
-    indexes = json.loads(http_get("https://index.commoncrawl.org/collinfo.json") or "[]")
-    year = time.gmtime().tm_year
-    for y in (str(year), str(year - 1)):          # neuester Index dieses und des Vorjahres
-        idx = next((i for i in indexes if y in i.get("id", "")), None)
-        if idx:
-            yield http_get(f"{idx['cdx-api']}?url=*.{d}&fl=url")
-
-
 # --- Subdomain- und DNS-Datenbanken
 def src_hackertarget(d):
     yield http_get(f"https://api.hackertarget.com/hostsearch/?q={d}")
 
 
-def src_anubis(d):
-    yield http_get(f"https://anubisdb.com/anubis/subdomains/{d}")
-
-
-def src_threatminer(d):
-    yield http_get(f"https://api.threatminer.org/v2/domain.php?q={d}&rt=5")
-
-
-def src_riddler(d):
-    yield http_get(f"https://riddler.io/search?q=pld:{d}&view_type=data_table")
-
-
-def src_reconcloud(d):
-    yield http_get(f"https://recon.cloud/api/search?domain={d}")
-
-
-def src_reconeer(d):
-    yield http_get(f"https://www.reconeer.com/api/domain/{d}")
-
-
 def src_subdomaincenter(d):
     yield http_get(f"https://api.subdomain.center/?domain={d}&engine=cuttlefish", {"Accept": "application/json"})
-
-
-def src_submd(d):
-    yield http_get(f"https://api.sub.md/v1/search?apex={d}")
-
-
-def src_scanmalware(d):
-    yield http_get(f"https://scanmalware.com/api/v1/ct/dns/{d}?subdomain_limit=5000",
-                   {"User-Agent": "scanmalware-subfinder/1.0 (+https://github.com/projectdiscovery/subfinder)"})
 
 
 def src_thc(d):
@@ -539,25 +468,10 @@ def src_rapiddns(d):
         page += 1
 
 
-def src_sitedossier(d):
-    url = f"http://www.sitedossier.com/parentdomain/{d}"
-    for _ in range(10):                           # Folgeseiten über den "weiter"-Link
-        text = http_get(url)
-        yield text
-        m = re.search(r'<a href="([A-Za-z0-9/.]+)"><b>', text)
-        if not m:
-            return
-        url = "http://www.sitedossier.com" + m.group(1)
-
-
 SOURCES = {
-    "crt.sh": src_crtsh, "certspotter": src_certspotter, "shodanct": src_shodanct,
-    "crtname": src_crtname, "digitorus": src_digitorus,
-    "wayback": src_wayback, "commoncrawl": src_commoncrawl,
-    "hackertarget": src_hackertarget, "anubis": src_anubis, "threatminer": src_threatminer,
-    "riddler": src_riddler, "reconcloud": src_reconcloud, "reconeer": src_reconeer,
-    "subdomaincenter": src_subdomaincenter, "submd": src_submd, "scanmalware": src_scanmalware,
-    "thc": src_thc, "rapiddns": src_rapiddns, "sitedossier": src_sitedossier,
+    "certspotter": src_certspotter, "shodanct": src_shodanct, "crtname": src_crtname,
+    "hackertarget": src_hackertarget, "subdomaincenter": src_subdomaincenter,
+    "thc": src_thc, "rapiddns": src_rapiddns,
 }
 
 
@@ -995,7 +909,8 @@ class Inventory:
         self.probed = set()      # (IP, Port, Hostname) bereits abgerufen
         self.services = []       # Ergebniszeilen
         self.findings = {}       # (Art, Gruppe) -> {type, detail, targets}
-        self.source_stats = {}   # Quelle -> {names, new, error}
+        self.source_stats = {}   # Quelle -> {names, exclusive, error, timeout}
+        self.source_names = {}   # Quelle -> gefundene Namen
 
         # Last und Sperr-Erkennung
         self.rate = RateLimiter(self.cfg["rate"])
@@ -1070,7 +985,7 @@ class Inventory:
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(64, len(jobs)))
 
         async def one(src, d):
-            st = self.source_stats.setdefault(src, {"names": 0, "new": 0, "error": "", "timeout": False})
+            st = self.source_stats.setdefault(src, {"names": 0, "exclusive": 0, "error": "", "timeout": False})
             t0 = time.time()
             try:
                 names, timed_out = await loop.run_in_executor(pool, run_source, src, d)
@@ -1078,17 +993,22 @@ class Inventory:
                 st["error"] = e.__class__.__name__
                 log(f"  {src:<16} {d}: nicht erreichbar ({st['error']}, {time.time() - t0:.0f}s)")
                 return
-            new = sum(self.add_host(n, src) for n in names)
+            for n in names:
+                self.add_host(n, src)
+            self.source_names.setdefault(src, set()).update(names)
             st["names"] += len(names)
-            st["new"] += new
             st["timeout"] |= timed_out
             note = f" – nach {SOURCE_TIMEOUT}s abgebrochen, Teilergebnis" if timed_out else ""
-            log(f"  {src:<16} {d}: {len(names):>5} Namen, {new:>4} neu ({time.time() - t0:.0f}s){note}")
+            log(f"  {src:<16} {d}: {len(names):>5} Namen ({time.time() - t0:.0f}s){note}")
         log(f"Passive Quellen ({len(SOURCES)}, parallel, je max. {SOURCE_TIMEOUT}s): {', '.join(SOURCES)}")
         try:
             await asyncio.gather(*[one(s, d) for s, d in jobs])
         finally:
             pool.shutdown(wait=False)
+        # Wie viele Namen kennt nur diese eine Quelle? (unabhängig davon, wer zuerst fertig war)
+        for src, names in self.source_names.items():
+            others = set().union(*[n for s, n in self.source_names.items() if s != src])
+            self.source_stats[src]["exclusive"] = len({norm_name(n) for n in names} - {norm_name(n) for n in others})
 
     async def collect_dns(self):
         """NS, MX, SOA, TXT (SPF), SRV und Zonentransfer-Versuch je Domain."""
@@ -1653,9 +1573,11 @@ class Inventory:
         cut = [s for s, v in self.source_stats.items() if v.get("timeout")]
         if cut:
             print(f"  nach {SOURCE_TIMEOUT}s abgebrochen (Teilergebnis): {', '.join(cut)}")
-        useful = sorted(((v["new"], s) for s, v in self.source_stats.items() if v["new"]), reverse=True)
-        if useful:
-            print("  neue Namen je Quelle: " + ", ".join(f"{s} {n}" for n, s in useful))
+        ranked = sorted(((v["names"], v["exclusive"], s) for s, v in self.source_stats.items() if v["names"]),
+                        reverse=True)
+        if ranked:
+            print("  Namen je Quelle (davon nur dort): "
+                  + ", ".join(f"{s} {n} ({x})" for n, x, s in ranked))
         print(f"Offene Ports:       {sum(map(len, self.open_ports.values()))} auf {len(self.open_ports)} IPs")
         print(f"Webdienste (URLs):  {len(web)}")
         for url in sorted(web)[:60]:
