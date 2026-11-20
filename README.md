@@ -1,6 +1,6 @@
 # webinventar
 
-Ermittelt alle öffentlich erreichbaren Webdienste der eigenen Netzbereiche und Domains. Das Ergebnis sind CSV-Dateien, in denen jede gefundene URL mit Titel, Technologie, Zertifikat und Auffälligkeiten steht.
+Ermittelt alle öffentlich erreichbaren Webdienste der eigenen Netzbereiche und Domains. Das Ergebnis ist eine Übersicht in Tabellenform im Terminal und eine JSON-Datei, in der jede gefundene URL mit Titel, Technologie, Zertifikat und Auffälligkeiten steht.
 
 Das Tool ist ein einzelnes Python-Skript ohne Abhängigkeiten außer der Standardbibliothek. Externe Dienste erfahren bei einem Scan nichts Neues über das untersuchte Netz.
 
@@ -58,7 +58,7 @@ Alternativ genügt es, die einzelne Datei `webinventar.py` herunterzuladen.
 
 ```bash
 python3 webinventar.py -d example.de example.com -n 203.0.113.0/24 198.51.100.0/26
-python3 webinventar.py -d domains.txt -n netze.txt -p web,top1000 --profil schonend -o inventar
+python3 webinventar.py -d domains.txt -n netze.txt -p web,top1000 --profil schonend -o inventar/
 ```
 
 | Parameter | Bedeutung | Standard |
@@ -68,7 +68,7 @@ python3 webinventar.py -d domains.txt -n netze.txt -p web,top1000 --profil schon
 | `-p` | Ports, die in den angegebenen Netzen geprüft werden: `web` (~100 Web-Ports), `top100`, `top1000`, `all` oder eine Liste wie `8000-8100,9443`. Kombinierbar, z. B. `web,top1000`. | `web` |
 | `--profil` | Wie stark das Tool die untersuchten Systeme belastet: `schonend`, `normal` oder `schnell` (siehe unten) | `normal` |
 | `-w` | zusätzliche Subdomain-Wortliste | – |
-| `-o` | Präfix der Ausgabedateien | `webinventar` |
+| `-o` | Verzeichnis für die JSON-Datei oder vollständiger Dateiname (`*.json`) | aktuelles Verzeichnis |
 | `--no-tech` | ohne Technologie-Erkennung | – |
 
 Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und alles nach `#` ignoriert. Ein Lauf ist auf 65.536 Adressen begrenzt, also ein /16. Größere Bereiche bitte aufteilen.
@@ -97,25 +97,48 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 
 ## Ausgaben
 
-| Datei | Inhalt |
+### Terminal
+
+Die Übersicht erscheint auf der Standardausgabe (STDOUT) und lässt sich mit `> bericht.txt` speichern. Fortschrittsmeldungen gehen auf STDERR. Die Übersicht hat vier Teile:
+
+1. **Webdienste:** eine Zeile je IP-Adresse und Port mit gleicher Antwort, also gleichem Status, Titel, gleicher Technik und gleichem Zertifikatsstatus. Alle Hostnamen mit dieser Antwort stehen in derselben Zeile. Ist nur eine Domain angegeben, fehlt sie in den Hostnamen, aus `www.example.de` wird also `www`. `(IP)` bedeutet: Abruf ohne Hostnamen. HTTP-Adressen, die nur auf HTTPS desselben Namens umleiten, werden nur gezählt.
+2. **Ohne Webdienst:** IP-Adressen mit Hostnamen oder offenen Ports, die kein HTTP sprechen. Aufeinanderfolgende Adressen mit durchnummerierten Namen werden zusammengefasst, z. B. `203.0.113.10 – 19  pc-0 … 9`.
+3. **Auffälligkeiten**, nach Schwere sortiert (`hoch`, `mittel`, `gering`).
+4. **Statistik:** Hostnamen, Quellen, offene Ports, Last und Pfad der JSON-Datei.
+
+### JSON-Datei
+
+Standardmäßig heißt die Datei `webinventar_<erstes Ziel>_<JJJJMMTT-HHMM>.json`, z. B. `webinventar_example.de_20261120-2156.json`. Das erste Ziel ist die erste angegebene Domain, sonst das erste Netz (`/` wird zu `_`). Mit `-o` lässt sich ein Verzeichnis oder ein eigener Dateiname angeben.
+
+Die Feldnamen lehnen sich an das [Elastic Common Schema (ECS)](https://www.elastic.co/guide/en/ecs/current/index.html) an, z. B. `url.full`, `destination.ip`, `http.response.status_code`, `tls.version` und `tls.server.x509.not_after`. Was ECS nicht kennt, steht unter `webinventar`. Leere Felder werden weggelassen.
+
+| Abschnitt | Inhalt |
 |---|---|
-| `*_services.csv` | eine Zeile je Webdienst (URL) bzw. offenem Port ohne HTTP |
-| `*_hosts.csv` | gefundene Hostnamen mit Status, IP-Adressen, CNAME-Kette und Fundquelle (z. B. `certspotter`, `wortliste`, `zertifikat`, `http-inhalt`). Namen, die nicht mehr existieren (oft alte Einträge aus Zertifikatsverzeichnissen), stehen nur in der JSON-Datei. |
-| `*_ips.csv` | je IP-Adresse: PTR-Eintrag, offene Ports, Hostnamen und Sperrhinweis |
-| `*.json` | alles zusammen, dazu Statistik und Auffälligkeiten |
+| `@timestamp`, `event`, `observer`, `schema_version` | Zeitpunkt, Beginn und Ende des Laufs, Version des Tools und des Formats |
+| `scope` | angegebene Domains und Netze |
+| `stats` | Verbindungen, DNS-Anfragen (`stats.dns`), Hostnamen (`stats.hosts`, nicht auflösbare nur als Anzahl je Status), Ergebnis je passiver Quelle (`stats.sources`) |
+| `findings` | Auffälligkeiten: `rule.name` (Art), `event.severity` (3 = hoch, 2 = mittel, 1 = gering), `message`, `targets` |
+| `services` | ein Eintrag je URL bzw. offenem Port ohne HTTP. Er lässt sich einzeln z. B. in Elasticsearch oder OpenSearch laden. |
+| `hosts` | aufgelöste Hostnamen mit IP-Adressen (`resolved_ip`), CNAME-Kette und Fundquellen (z. B. `certspotter`, `wortliste`, `zertifikat`, `http-inhalt`). Namen, die nicht existieren, werden nicht exportiert. Verwaiste CNAMEs bleiben enthalten. |
+| `ips` | je IP-Adresse: PTR-Eintrag (`domain`), offene Ports, Hostnamen, Sperrhinweis |
+| `certificates` | jedes gefundene Zertifikat einmal, mit SHA-256-Fingerprint als Schlüssel, Aussteller, Laufzeit und allen Namen (SANs). `services[].tls.server.hash.sha256` verweist darauf. |
 
-Die CSV-Dateien nutzen `;` als Trennzeichen und lassen sich direkt in Excel öffnen.
+Wichtige Felder unter `services[].webinventar`:
 
-Wichtige Spalten in `*_services.csv`:
+- `title`, `server`, `technologies` (erkannte Technologien mit Version, soweit ermittelbar)
+- `redirect`: `location` ist das erste Ziel. `final_url`, `final_status_code` und `final_title` geben an, wohin die Kette führt.
+- `certificate_valid` gibt an, ob das Zertifikat für diesen Hostnamen gültig ist. Bei `false` steht der Grund in `certificate_error`.
+- `same_as_default: true`: Der Server liefert für diesen Namen keine eigene Seite, sondern seine Standardseite.
+- `note`: z. B. „Port offen, kein HTTP“
 
-- `url`, `status`, `title`, `server`
-- `tech`: erkannte Technologien mit Version, soweit ermittelbar
-- `final_url`, `final_status`, `final_title`: wohin eine Weiterleitung führt
-- `cert_*`: Aussteller, Ablaufdatum, enthaltene Namen (SANs); `cert_valid` gibt an, ob das Zertifikat für diesen Hostnamen gültig ist
-- `foreign_name = ja`: fremder Hostname, der in eines der angegebenen Netze zeigt
-- `notes`:
-  - „gleiche Antwort wie ohne Hostname“: Der Server liefert für diesen Namen keine eigene Seite, sondern seine Standardseite.
-  - „Port offen, kein HTTP“
+Beispiele mit [jq](https://jqlang.org/):
+
+```bash
+# alle URLs mit Status und Titel
+jq -r '.services[] | [.url.full, .http.response.status_code, .webinventar.title] | @tsv' webinventar_*.json
+# alle Befunde der Stufe „hoch“
+jq '.findings[] | select(.event.severity == 3)' webinventar_*.json
+```
 
 ### Auffälligkeiten (am Ende der Ausgabe und in der JSON-Datei)
 
@@ -140,7 +163,7 @@ Gleiche Befunde werden zu einem Eintrag mit allen betroffenen Adressen zusammeng
 | `normal` | 100 | 4 | 5 min |
 | `schnell` | unbegrenzt | 50 | 2 min |
 
-Dazu kommen pro Lauf etwa 2–4 Minuten für passive Quellen (höchstens 60 Sekunden, parallel zur DNS-Phase), DNS und HTTP-Abrufe. DNS-Anfragen werden auf höchstens 20 pro Sekunde je Nameserver begrenzt. Bleiben Antworten aus, weil der Nameserver Anfragen drosselt (Rate Limiting), senkt das Tool die Rate für diesen Server selbstständig, bis auf 5 pro Sekunde, und hebt sie bei Antworten wieder an. Fehlende Antworten wiederholt es nach einer kurzen Pause. Nicht existierende Namen merkt es sich, damit dazu keine weiteren Anfragen nötig sind. Namen, die danach noch ohne Antwort sind, versucht es nach 10 Sekunden ein weiteres Mal. In der JSON-Datei stehen unter `load` die Zahl der DNS-Anfragen, der Wiederholungen und die Nameserver, deren Rate gesenkt wurde. Je Hostname sendet das Tool nur `GET /`, ohne Pfade durchzuprobieren oder Logins zu versuchen. Am Ende zeigt es, wie viele Verbindungen es auf den untersuchten Systemen erzeugt hat.
+Dazu kommen pro Lauf etwa 2–4 Minuten für passive Quellen (höchstens 60 Sekunden, parallel zur DNS-Phase), DNS und HTTP-Abrufe. DNS-Anfragen werden auf höchstens 20 pro Sekunde je Nameserver begrenzt. Bleiben Antworten aus, weil der Nameserver Anfragen drosselt (Rate Limiting), senkt das Tool die Rate für diesen Server selbstständig, bis auf 5 pro Sekunde, und hebt sie bei Antworten wieder an. Fehlende Antworten wiederholt es nach einer kurzen Pause. Nicht existierende Namen merkt es sich, damit dazu keine weiteren Anfragen nötig sind. Namen, die danach noch ohne Antwort sind, versucht es nach 10 Sekunden ein weiteres Mal. In der JSON-Datei stehen unter `stats.dns` die Zahl der DNS-Anfragen, der Wiederholungen und die Nameserver, deren Rate gesenkt wurde. Je Hostname sendet das Tool nur `GET /`, ohne Pfade durchzuprobieren oder Logins zu versuchen. Am Ende zeigt es, wie viele Verbindungen es auf den untersuchten Systemen erzeugt hat.
 
 **Sperr-Erkennung:** Das Tool merkt sich pro IP-Adresse einen Port, der nachweislich offen war. Nach dem Portscan und nach jeder Runde HTTP-Abrufe prüft es diesen Port erneut. Antwortet er nicht mehr, hat vermutlich fail2ban, ein IPS oder eine WAF den Scanner gesperrt. Dann warnt das Tool und markiert die Ergebnisse dieser IP-Adresse als unvollständig.
 
@@ -156,8 +179,11 @@ Empfehlung: Die IP-Adresse des Scan-Rechners in fail2ban (`ignoreip`), im IPS un
 
 ## Regelmäßig ausführen
 
-Wird der Lauf z. B. wöchentlich gestartet und die `*_services.csv` jeweils mit dem Vorlauf verglichen, fallen neue oder vergessene Dienste schnell auf:
+Wird der Lauf z. B. wöchentlich gestartet und die Liste der URLs jeweils mit dem Vorlauf verglichen, fallen neue oder vergessene Dienste schnell auf. Durch den Zeitstempel im Dateinamen überschreibt ein Lauf den vorigen nicht:
 
 ```bash
-python3 webinventar.py -d domains.txt -n netze.txt -o inventar_$(date +%F)
+mkdir -p inventar
+python3 webinventar.py -d domains.txt -n netze.txt -o inventar/ > inventar/bericht_$(date +%F).txt
+diff <(jq -r '.services[].url.full' inventar/webinventar_example.de_20261113-*.json | sort) \
+     <(jq -r '.services[].url.full' inventar/webinventar_example.de_20261120-*.json | sort)
 ```

@@ -30,8 +30,8 @@ Nur gegen Netze und Domains einsetzen, für die ihr berechtigt seid.
 import argparse
 import asyncio
 import concurrent.futures
-import csv
 import hashlib
+import html
 import ipaddress
 import json
 import struct
@@ -48,7 +48,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.6"
+VERSION = "3.7"
+SCHEMA_VERSION = "2"
 
 # ============================================================== Einstellungen
 
@@ -965,6 +966,8 @@ class Inventory:
         self.findings = {}       # (Art, Gruppe) -> {type, detail, targets}
         self.source_stats = {}   # Quelle -> {names, exclusive, error, timeout}
         self.source_names = {}   # Quelle -> gefundene Namen
+        self.certs = {}          # SHA-256 -> Zertifikatsangaben (für die JSON-Datei)
+        self.started = time.time()
 
         # Last und Sperr-Erkennung
         self.rate = RateLimiter(self.cfg["rate"])
@@ -1285,14 +1288,17 @@ class Inventory:
         out = {}
         if tls:
             sslobj = w.get_extra_info("ssl_object")
-            cert = decode_der_cert(sslobj.getpeercert(binary_form=True) or b"") if sslobj else {}
+            der = (sslobj.getpeercert(binary_form=True) or b"") if sslobj else b""
+            cert = decode_der_cert(der) if der else {}
             out.update({
                 "tls_version": sslobj.version() if sslobj else "",
                 "tls_cipher": (sslobj.cipher() or [""])[0] if sslobj else "",
                 "cert_cn": cert_field(cert.get("subject"), "commonName"),
                 "cert_issuer": cert_field(cert.get("issuer"), "organizationName")
                 or cert_field(cert.get("issuer"), "commonName"),
+                "cert_not_before": cert.get("notBefore", ""),
                 "cert_not_after": cert.get("notAfter", ""),
+                "cert_sha256": hashlib.sha256(der).hexdigest() if der else "",
                 "cert_sans": [v for k, v in cert.get("subjectAltName", ()) if k == "DNS"],
             })
         request = (f"GET {path} HTTP/1.1\r\nHost: {host_header(host, ip, port, tls)}\r\n"
@@ -1425,10 +1431,14 @@ class Inventory:
             tech |= set(self.tech.detect(final["headers"], final["cookies"], final["body"]))
         row.update({k: res.get(k, "") for k in (
             "status", "title", "server", "location", "content_type", "length", "response_ms",
-            "body_hash", "tls_version", "tls_cipher", "cert_cn", "cert_issuer", "cert_not_after")})
+            "body_hash", "tls_version", "tls_cipher", "cert_cn", "cert_issuer", "cert_not_after",
+            "cert_sha256")})
+        if res.get("cert_sha256"):
+            self.certs.setdefault(res["cert_sha256"], {
+                k: res.get(f"cert_{k}") for k in ("cn", "issuer", "not_before", "not_after", "sans")})
         row.update({
-            "scheme": "https" if tls else "http", "url": url, "tech": ", ".join(sorted(tech)),
-            "hsts": res["hsts"] if tls else "", "cert_sans": " ".join(res.get("cert_sans", [])),
+            "scheme": "https" if tls else "http", "url": url, "tech": sorted(tech),
+            "hsts": res["hsts"] if tls else "",
             "final_url": chain[-1] if chain else "",
             "final_status": final["status"] if final else "", "final_title": final["title"] if final else "",
             "cert_valid": "" if ver is None else
@@ -1537,7 +1547,7 @@ class Inventory:
             url, status, tls = r["url"], r.get("status"), r.get("scheme") == "https"
             if r["hostname"] and r.get("body_hash") and defaults.get((r["ip"], r["port"])) == \
                     (status, r.get("body_hash")):
-                r["notes"] = "gleiche Antwort wie ohne Hostname"
+                r["same_as_default"] = True
             if r.get("scheme") == "http" and status == 200:
                 self.finding("HTTP ohne Umleitung", url, "unverschlüsselt, keine Weiterleitung auf HTTPS")
             # Umleitung von HTTPS auf HTTP (erster Schritt oder Ziel der Kette)
@@ -1559,7 +1569,10 @@ class Inventory:
                 elif days is not None and days < CERT_WARN_DAYS:
                     self.finding("Zertifikat läuft bald ab", host, f"{cert}, noch {int(days)} Tage", cert)
             if str(r.get("cert_valid", "")).startswith("nein"):
-                self.finding("Zertifikat ungültig", url, r["cert_valid"][6:])
+                # Hostname aus der Meldung entfernen, damit ein Zertifikat ein Befund bleibt
+                err = re.sub(r",? ?certificate is not valid for '[^']*'\.?", "", r["cert_valid"][6:])
+                cert = f"{err} – Zertifikat für {r.get('cert_cn') or '?'}"
+                self.finding("Zertifikat ungültig", url, cert, cert)
             if tls and r["hostname"] and r.get("cert_valid") == "ja" and isinstance(status, int) \
                     and 200 <= status < 400 and not r.get("hsts"):
                 self.finding("HTTPS ohne HSTS", url, "kein Strict-Transport-Security-Header")
@@ -1568,100 +1581,329 @@ class Inventory:
             if r.get("error_details"):
                 self.finding("Fehlerseite mit technischen Details", url,
                              f"enthält „{r['error_details']}“ – kann Pfade, Versionen oder Code verraten")
-            text = f"{r.get('title', '')} {r.get('final_title', '')} {r.get('tech', '')}".strip()
+            text = f"{r.get('title', '')} {r.get('final_title', '')} {', '.join(r.get('tech', []))}".strip()
             if (status in (200, 401, 403) or r.get("final_status") == 200) and SENSITIVE.search(text):
                 self.finding("Sensible Oberfläche?", url, text[:120])
 
     # ---------------------------------------------------------- Ausgabe
-    def write(self, prefix):
-        cols = ["url", "scheme", "hostname", "ip", "port", "in_own_net", "status", "title", "tech",
-                "server", "final_url", "final_status", "final_title", "location", "content_type",
-                "length", "response_ms", "body_hash", "hsts", "tls_version", "tls_cipher", "cert_cn",
-                "cert_issuer", "cert_not_after", "cert_valid", "cert_sans", "error_details", "cname", "ptr",
-                "foreign_name", "notes"]
+    def first_target(self):
+        return self.domains[0] if self.domains else (str(self.nets[0]) if self.nets else "")
+
+    def report(self):
+        """Alle Ergebnisse als ein Dokument. Feldnamen lehnen sich an das Elastic Common Schema
+        (ECS) an; was ECS nicht kennt, steht unter 'webinventar'. Leere Felder entfallen."""
         rows = sorted(self.services, key=lambda r: (ip_sort_key(r["ip"]), r["port"], r["hostname"]))
-        with open(f"{prefix}_services.csv", "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", delimiter=";")
-            w.writeheader()
-            w.writerows(rows)
-
-        hosts = sorted((h for h in self.hosts.values() if h["status"] not in ("out-of-scope", "wildcard")),
+        hosts = sorted((h for h in self.hosts.values() if h["status"] in KEEP_STATUS),
                        key=lambda h: h["name"].split(".")[::-1])
-        csv_hosts = [h for h in hosts if h["status"] != "nxdomain"]   # vollständig nur im JSON
-        with open(f"{prefix}_hosts.csv", "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow(["hostname", "status", "a", "aaaa", "cname", "in_own_net", "foreign_name", "sources"])
-            for h in csv_hosts:
-                addrs = h["a"] + h["aaaa"]
-                w.writerow([h["name"], h["status"], " ".join(h["a"]), " ".join(h["aaaa"]),
-                            " -> ".join(h["cname"]),
-                            ("ja" if any(map(self.in_net, addrs)) else "nein") if addrs else "",
-                            "ja" if h["net_only"] else "", " ".join(sorted(h["sources"]))])
-
+        unresolved = {}
+        for h in self.hosts.values():
+            if h["status"] not in KEEP_STATUS and h["status"] not in ("out-of-scope", "pending"):
+                unresolved[h["status"]] = unresolved.get(h["status"], 0) + 1
         ips = sorted((i for i in self.ips.values() if self.open_ports.get(i["ip"]) or i["hostnames"]),
                      key=lambda i: ip_sort_key(i["ip"]))
-        with open(f"{prefix}_ips.csv", "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow(["ip", "in_own_net", "ptr", "open_ports", "hostnames", "blocked"])
-            for i in ips:
-                w.writerow([i["ip"], "ja" if i["in_net"] else "nein", i["ptr"],
-                            " ".join(map(str, sorted(self.open_ports.get(i["ip"], [])))),
-                            " ".join(sorted(i["hostnames"])), self.blocked.get(i["ip"], "")])
+        busiest = max(self.conn_per_ip.items(), key=lambda x: x[1], default=None)
+        used = {r.get("cert_sha256") for r in rows}
+        return prune({
+            "@timestamp": iso_time(time.time()),
+            "schema_version": SCHEMA_VERSION,
+            "observer": {"product": "webinventar", "version": VERSION},
+            "event": {"start": iso_time(self.started), "end": iso_time(time.time())},
+            "scope": {"domains": self.domains, "networks": [str(n) for n in self.nets],
+                      "ports": len(self.ports)},
+            "stats": {
+                "tcp_connections": self.stats["tcp"], "http_requests": self.stats["http"],
+                "max_connections_per_ip": {"ip": busiest[0], "count": busiest[1]} if busiest else None,
+                "dns": {"queries": self.dns.queries, "retries": self.dns.retries,
+                        "throttled_servers": sorted(self.dns.throttled)},
+                "hosts": {"resolved": len(hosts), "unresolved": unresolved},
+                "sources": self.source_stats,
+            },
+            "findings": [{"rule": {"name": fd["type"]},
+                          "event": {"severity": SEVERITY.get(fd["type"], 1)},
+                          "message": fd["detail"], "targets": fd["targets"]}
+                         for fd in self.sorted_findings()],
+            "services": [self.ecs_service(r) for r in rows],
+            "hosts": [{"name": h["name"], "resolved_ip": h["a"] + h["aaaa"], "cname": h["cname"],
+                       "sources": sorted(h["sources"]),
+                       "webinventar": {"status": "" if h["status"] == "resolved" else h["status"],
+                                       "foreign_name": h["net_only"] or None}} for h in hosts],
+            "ips": [{"ip": i["ip"], "domain": i["ptr"],
+                     "open_ports": sorted(self.open_ports.get(i["ip"], [])),
+                     "hostnames": sorted(i["hostnames"]),
+                     "webinventar": {"in_scope_network": i["in_net"] if self.nets else None,
+                                     "blocked_after": self.blocked.get(i["ip"])}} for i in ips],
+            "certificates": {sha: {"x509": {
+                "subject": {"common_name": [c["cn"]] if c["cn"] else []},
+                "issuer": {"organization": [c["issuer"]] if c["issuer"] else []},
+                "not_before": iso_cert_time(c["not_before"]),
+                "not_after": iso_cert_time(c["not_after"]),
+                "alternative_names": c["sans"]}} for sha, c in sorted(self.certs.items()) if sha in used},
+        })
 
-        with open(f"{prefix}.json", "w", encoding="utf-8") as f:
-            json.dump({"generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "version": VERSION,
-                       "scope": {"domains": self.domains, "nets": [str(n) for n in self.nets]},
-                       "load": {**self.stats, "dns_queries": self.dns.queries,
-                                "dns_retries": self.dns.retries,
-                                "dns_throttled_servers": sorted(self.dns.throttled)},
-                       "sources": self.source_stats, "findings": list(self.findings.values()),
-                       "services": rows,
-                       "hosts": [{**h, "sources": sorted(h["sources"])} for h in hosts],
-                       "ips": [{**i, "hostnames": sorted(i["hostnames"]),
-                                "open_ports": sorted(self.open_ports.get(i["ip"], []))} for i in ips]},
-                      f, indent=2, ensure_ascii=False)
+    def ecs_service(self, r):
+        url = urllib.parse.urlsplit(r["url"]) if "://" in r["url"] else None
+        valid = str(r.get("cert_valid", ""))
+        proto, _, ver = str(r.get("tls_version", "")).partition("v")
+        return {
+            "url": {"full": r["url"], "scheme": r["scheme"], "domain": url.hostname,
+                    "port": r["port"]} if url else None,
+            "destination": {"ip": r["ip"], "port": r["port"]},
+            "http": {"response": {"status_code": r.get("status"), "mime_type": r.get("content_type")}},
+            "tls": {"version_protocol": proto.lower(), "version": TLS_VERSIONS.get(ver, ver),
+                    "cipher": r.get("tls_cipher"),
+                    "server": {"hash": {"sha256": r.get("cert_sha256")},
+                               "not_after": iso_cert_time(r.get("cert_not_after", "")),
+                               "x509": {"subject": {"common_name": [r["cert_cn"]] if r.get("cert_cn") else []},
+                                        "issuer": {"organization": [r["cert_issuer"]]
+                                                   if r.get("cert_issuer") else []}}}},
+            "webinventar": {
+                "title": r.get("title"), "server": r.get("server"), "technologies": r.get("tech"),
+                "redirect": {"location": r.get("location"), "final_url": r.get("final_url"),
+                             "final_status_code": r.get("final_status"), "final_title": r.get("final_title")},
+                "hsts": r.get("hsts") if r.get("scheme") == "https" and r.get("status") else None,
+                "certificate_valid": valid.startswith("ja") if valid else None,
+                "certificate_error": valid[6:] if valid.startswith("nein") else None,
+                "same_as_default": r.get("same_as_default"),
+                "error_details": r.get("error_details"), "note": r.get("notes"),
+            },
+        }
 
-    def summary(self):
-        web = {}
+    def sorted_findings(self):
+        return sorted(self.findings.values(), key=lambda fd: (-SEVERITY.get(fd["type"], 1), fd["type"]))
+
+    def write(self, path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.report(), f, indent=2, ensure_ascii=False)
+            f.write("\n")
+
+    # ---------------------------------------------------------- Zusammenfassung (STDOUT)
+    def short(self, name):
+        """Hostname ohne die eigene Domain, wenn nur eine angegeben ist."""
+        if len(self.domains) == 1 and name.endswith("." + self.domains[0]):
+            return name[:-len(self.domains[0]) - 1]
+        return name
+
+    @staticmethod
+    def is_https_upgrade(r):
+        """HTTP-Zeile, die nur auf HTTPS desselben Namens weiterleitet (unauffällig)."""
+        if r.get("scheme") != "http" or not r.get("location"):
+            return False
+        target = urllib.parse.urlsplit(urllib.parse.urljoin(r["url"], r["location"]))
+        return target.scheme == "https" and target.hostname == (r["hostname"] or r["ip"])
+
+    def cert_label(self, r):
+        if r.get("scheme") != "https":
+            return "–"
+        until = iso_cert_time(r.get("cert_not_after", ""))[:10]
+        valid = str(r.get("cert_valid", ""))
+        if valid.startswith("ja"):
+            return f"ok bis {until}"
+        if not valid:
+            return f"bis {until}" if until else ""
+        err = valid[6:].lower()
+        for key, label in (("mismatch", "Name passt nicht"), ("expired", "abgelaufen"),
+                           ("self-signed", "selbstsigniert"), ("self signed", "selbstsigniert"),
+                           ("local issuer", "Kette unvollständig")):
+            if key in err:
+                return f"ungültig: {label}"
+        return "ungültig"
+
+    def title_label(self, r):
+        title = r.get("title", "")
+        if r.get("final_url"):
+            src, dst = urllib.parse.urlsplit(r["url"]), urllib.parse.urlsplit(r["final_url"])
+            same = (src.hostname, src.scheme) == (dst.hostname, dst.scheme)
+            target = (dst.path or "/") if same else r["final_url"]
+            title = f"→ {target}" + (f" „{r['final_title']}“" if r.get("final_title") else "")
+        elif r.get("location"):
+            title = f"→ {r['location']}"
+        return html.unescape(title)
+
+    def web_table(self):
+        groups, hidden = {}, 0
         for r in self.services:
-            if r.get("status"):
-                web.setdefault(r["url"], r)
-        print("\n=== Ergebnis ===")
-        print(f"Hostnamen:          {len(self.live_hosts())} aufgelöst "
-              f"(davon fremde Namen in euren Netzen: {sum(h['net_only'] for h in self.live_hosts())})")
-        failed = [s for s, v in self.source_stats.items() if v["error"] and not v["names"]]
-        if failed:
-            print(f"  nicht erreichbar:  {', '.join(failed)}")
-        cut = [s for s, v in self.source_stats.items() if v.get("timeout")]
-        if cut:
-            print(f"  nach {SOURCE_TIMEOUT}s abgebrochen (Teilergebnis): {', '.join(cut)}")
-        ranked = sorted(((v["names"], v["exclusive"], s) for s, v in self.source_stats.items() if v["names"]),
-                        reverse=True)
-        if ranked:
-            print("  Namen je Quelle (davon nur dort): "
-                  + ", ".join(f"{s} {n} ({x})" for n, x, s in ranked))
-        print(f"Offene Ports:       {sum(map(len, self.open_ports.values()))} auf {len(self.open_ports)} IPs")
-        print(f"Webdienste (URLs):  {len(web)}")
-        for url in sorted(web)[:60]:
-            r = web[url]
-            info = r.get("title") or (f"-> {r['final_url']}" if r.get("final_url") else "")
-            print(f"  {r['status']:>3}  {url:<50} {info[:40]:<40} {r.get('tech', '')[:45]}")
-        if len(web) > 60:
-            print(f"  … {len(web) - 60} weitere, siehe CSV")
-        busiest = max(self.conn_per_ip.items(), key=lambda x: x[1], default=("-", 0))
-        print(f"\nLast auf euren Systemen: {self.stats['tcp']} TCP-Verbindungen, {self.stats['http']} "
-              f"HTTP-Anfragen, max. {busiest[1]} Verbindungen auf eine IP ({busiest[0]})")
+            if not r.get("status"):
+                continue
+            if self.is_https_upgrade(r):
+                hidden += 1
+                continue
+            status = f"{r['status']}→{r['final_status']}" if r.get("final_status") else str(r["status"])
+            tech = ", ".join(t.replace(":", " ") for t in r.get("tech", []) if t not in TECH_NOISE)
+            key = (ip_sort_key(r["ip"]), r["port"], r["scheme"], status, self.title_label(r), tech,
+                   self.cert_label(r))
+            groups.setdefault(key, []).append(r["hostname"])
+        rows = []
+        for key, names in sorted(groups.items()):
+            _, port, scheme, status, title, tech, cert = key
+            ip = next(r["ip"] for r in self.services if ip_sort_key(r["ip"]) == key[0])
+            shown = (["(IP)"] if "" in names else []) + sorted(self.short(n) for n in names if n)
+            rows.append([scheme, f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}", status, title, tech,
+                         cert, cap_list(shown, 70)])
+        return rows, hidden
+
+    def quiet_table(self):
+        """IPs mit Hostnamen oder offenen Ports, aber ohne Webdienst. Aufeinanderfolgende
+        Adressen mit durchnummerierten Namen (pc-1, pc-2, …) werden zu einer Zeile zusammengefasst."""
+        web = {r["ip"] for r in self.services if r.get("status")}
+        items = []
+        for i in sorted(self.ips.values(), key=lambda i: ip_sort_key(i["ip"])):
+            if i["ip"] in web or not (i["hostnames"] or self.open_ports.get(i["ip"])):
+                continue
+            ports = ",".join(map(str, sorted(self.open_ports.get(i["ip"], [])))) or "–"
+            names = sorted(self.short(n) for n in i["hostnames"])
+            items.append([i["ip"], ports, names])
+        rows, run = [], []
+
+        def flush():
+            if len(run) > 2:
+                m0, m1 = (re.fullmatch(r"(.*?)(\d+)", run[k][2][0]) for k in (0, -1))
+                rows.append([f"{run[0][0]} – {run[-1][0].rsplit('.', 1)[-1]}", run[0][1],
+                             f"{m0.group(1)}{m0.group(2)} … {m1.group(2)} ({len(run)} Adressen)"])
+            else:
+                rows.extend([ip, ports, cap_list(names, 70)] for ip, ports, names in run)
+            run.clear()
+
+        for it in items:
+            m = re.fullmatch(r"(.*?)(\d+)", it[2][0]) if len(it[2]) == 1 else None
+            if run and m and it[1] == run[-1][1] and consecutive(run[-1][0], it[0]):
+                p = re.fullmatch(r"(.*?)(\d+)", run[-1][2][0])
+                if p.group(1) == m.group(1) and int(m.group(2)) == int(p.group(2)) + 1:
+                    run.append(it)
+                    continue
+            flush()
+            if m:
+                run.append(it)
+            else:
+                rows.append([it[0], it[1], cap_list(it[2], 70)])
+        flush()
+        return rows
+
+    def summary(self, path, runtime):
+        rows, hidden = self.web_table()
+        print(f"\n=== Webdienste ({len(rows)}) ===")
+        print_table(["", "Adresse", "Status", "Titel / Ziel", "Technik", "Zertifikat", "Hostnamen"],
+                    rows, [5, 40, 9, 45, 32, 24, 0])
+        if hidden:
+            print(f"({hidden} HTTP-Adressen, die nur auf HTTPS desselben Namens umleiten, nicht aufgeführt)")
+        quiet = self.quiet_table()
+        if quiet:
+            print(f"\n=== Ohne Webdienst ({len(quiet)}) ===")
+            print_table(["IP", "Ports", "Hostnamen"], quiet, [36, 20, 0])
+
         if self.blocked:
             print(f"\n!!! {len(self.blocked)} IP(s) haben den Scanner offenbar gesperrt, Ergebnisse "
                   f"unvollständig: {', '.join(sorted(self.blocked))}\n    -> Scanner-IP freischalten "
                   "(fail2ban ignoreip, IPS-/WAF-Ausnahme) oder mit --profil schonend nur diese IPs "
                   "erneut prüfen (-n IP).")
         if self.findings:
-            print(f"\nAuffälligkeiten ({len(self.findings)}):")
-            for fd in self.findings.values():
+            print(f"\n=== Auffälligkeiten ({len(self.findings)}) ===")
+            for fd in self.sorted_findings():
                 t = fd["targets"]
-                more = f" … und {len(t) - 5} weitere (siehe JSON)" if len(t) > 5 else ""
-                print(f"  [{fd['type']}] {fd['detail']}\n      {', '.join(t[:5])}{more}")
+                more = f" … und {len(t) - 5} weitere" if len(t) > 5 else ""
+                level = SEVERITY_LABEL[SEVERITY.get(fd["type"], 1)]
+                print(f"  [{level}] {fd['type']}: {fd['detail']}\n           {', '.join(t[:5])}{more}")
+
+        print("\n=== Statistik ===")
+        unresolved = sum(h["status"] not in KEEP_STATUS and h["status"] not in ("out-of-scope", "pending")
+                         for h in self.hosts.values())
+        live = self.live_hosts()
+        foreign = sum(h["net_only"] for h in live)
+        print(f"Hostnamen:  {len(live)} aufgelöst" + (f" (davon {foreign} fremde in euren Netzen)" if foreign else "")
+              + f", {unresolved} nicht auflösbar (nicht exportiert)")
+        ranked = sorted(((v["names"], v["exclusive"], s) for s, v in self.source_stats.items() if v["names"]),
+                        reverse=True)
+        if ranked:
+            print("Quellen:    " + ", ".join(f"{s} {n} ({x} nur dort)" for n, x, s in ranked))
+        failed = [s for s, v in self.source_stats.items() if v["error"] and not v["names"]]
+        cut = [s for s, v in self.source_stats.items() if v.get("timeout")]
+        if failed:
+            print(f"            nicht erreichbar: {', '.join(failed)}")
+        if cut:
+            print(f"            nach {SOURCE_TIMEOUT}s abgebrochen (Teilergebnis): {', '.join(cut)}")
+        busiest = max(self.conn_per_ip.items(), key=lambda x: x[1], default=("-", 0))
+        print(f"Ports:      {sum(map(len, self.open_ports.values()))} offen auf {len(self.open_ports)} IPs")
+        print(f"Last:       {self.stats['tcp']} TCP-Verbindungen, {self.stats['http']} HTTP-Anfragen, "
+              f"{self.dns.queries} DNS-Anfragen, max. {busiest[1]} Verbindungen auf eine IP ({busiest[0]})")
+        print(f"Laufzeit:   {runtime:.0f}s")
+        print(f"Datei:      {path}")
+
+
+# Hosts mit diesem Status kommen in die JSON-Datei, alle anderen werden nur gezählt
+KEEP_STATUS = ("resolved", "resolved (wildcard)", "dangling-cname")
+SEVERITY = {"Zonentransfer offen": 3, "Verwaister CNAME": 3, "Zertifikat abgelaufen": 3,
+            "Veraltetes TLS": 3, "Fehlerseite mit technischen Details": 3,
+            "Zertifikat ungültig": 2, "Umleitung von HTTPS auf HTTP": 2, "HTTP ohne Umleitung": 2,
+            "Zertifikat läuft bald ab": 2, "Scanner vermutlich gesperrt": 2,
+            "HTTPS ohne HSTS": 1, "Sensible Oberfläche?": 1}
+SEVERITY_LABEL = {3: "hoch  ", 2: "mittel", 1: "gering"}
+TLS_VERSIONS = {"3": "3.0"}
+# In der Tabelle weggelassen (fast überall vorhanden, ohne Aussagekraft); im JSON vollständig
+TECH_NOISE = {"HSTS", "jQuery Migrate", "imagesLoaded", "Font Awesome", "Lightbox"}
+
+
+def prune(obj):
+    """Leere Werte ("", None, [], {}) rekursiv entfernen; False und 0 bleiben."""
+    if isinstance(obj, dict):
+        obj = {k: prune(v) for k, v in obj.items()}
+        return {k: v for k, v in obj.items() if v not in ("", None, [], {})}
+    if isinstance(obj, list):
+        return [prune(v) for v in obj]
+    return obj
+
+
+def iso_time(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
+
+
+def iso_cert_time(value):
+    """'Feb  6 20:25:54 2027 GMT' -> '2027-02-06T20:25:54Z'"""
+    if not value:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ssl.cert_time_to_seconds(value)))
+    except ValueError:
+        return value
+
+
+def consecutive(a, b):
+    try:
+        return int(ipaddress.ip_address(b)) == int(ipaddress.ip_address(a)) + 1
+    except ValueError:
+        return False
+
+
+def cap_list(items, width):
+    """Liste kommagetrennt, höchstens etwa width Zeichen, Rest als '(+n)'."""
+    out = []
+    for i, item in enumerate(items):
+        if out and len(", ".join(out + [item])) > width:
+            return ", ".join(out) + f" (+{len(items) - i})"
+        out.append(item)
+    return ", ".join(out)
+
+
+def print_table(headers, rows, widths):
+    """Einfache Texttabelle; widths begrenzt die Spaltenbreite (0 = unbegrenzt, letzte Spalte)."""
+    def cut(v, w):
+        v = str(v)
+        return v if not w or len(v) <= w else v[:w - 1] + "…"
+    rows = [[cut(v, w) for v, w in zip(r, widths)] for r in rows]
+    size = [max([len(h)] + [len(r[k]) for r in rows]) for k, h in enumerate(headers)]
+    for r in [headers] + rows:
+        print("  " + "  ".join(v.ljust(size[k]) if k < len(r) - 1 else v for k, v in enumerate(r)).rstrip())
+
+
+def output_path(out, first, started):
+    """Dateiname webinventar_<erstes Ziel>_<JJJJMMTT-HHMM>.json; -o ist ein Verzeichnis
+    oder ein vollständiger Dateiname (*.json)."""
+    if out and out.lower().endswith(".json"):
+        return out
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", first).strip("_") or "scan"
+    name = f"webinventar_{name}_{time.strftime('%Y%m%d-%H%M', time.localtime(started))}.json"
+    if out:
+        os.makedirs(out, exist_ok=True)
+        return os.path.join(out, name)
+    return name
 
 
 def dechunk(body):
@@ -1699,7 +1941,9 @@ def main():
     p.add_argument("--profil", choices=PROFILES, default="normal",
                    help="Last: schonend (20 Verb./s, 1 je Host), normal (100/s, 4 je Host), schnell")
     p.add_argument("-w", "--wordlist", help="zusätzliche Subdomain-Wortliste")
-    p.add_argument("-o", "--out", default="webinventar", help="Präfix der Ausgabedateien")
+    p.add_argument("-o", "--out", metavar="PFAD",
+                   help="Verzeichnis für die JSON-Datei oder vollständiger Dateiname (*.json); "
+                        "Standard: webinventar_<erstes Ziel>_<Datum-Uhrzeit>.json im aktuellen Verzeichnis")
     p.add_argument("--no-tech", action="store_true",
                    help="ohne Technologie-Erkennung (lädt dann nichts von GitHub)")
     # Für Tests: eigene Root-Server und feste Zuordnungen, in der Hilfe ausgeblendet
@@ -1732,17 +1976,14 @@ def main():
             f"{attempts / cfg['rate'] / 60:.0f} Minuten.")
 
     inv = Inventory(domains, nets, ports, a.profil, a.wordlist, not a.no_tech, roots, overrides)
-    t0 = time.time()
+    path = output_path(a.out, norm_name(domains[0]) if domains else nets[0], inv.started)
     try:
         asyncio.run(inv.run())
     except KeyboardInterrupt:
         log("Abgebrochen – schreibe bisherige Ergebnisse.")
         inv.analyse()
-    inv.write(a.out)
-    inv.summary()
-    print(f"\nDateien: {a.out}_services.csv, {a.out}_hosts.csv, {a.out}_ips.csv, {a.out}.json "
-          f"(Laufzeit {time.time() - t0:.0f}s)")
-
+    inv.write(path)
+    inv.summary(path, time.time() - inv.started)
 
 if __name__ == "__main__":
     main()
