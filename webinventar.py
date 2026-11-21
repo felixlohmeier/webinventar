@@ -32,6 +32,7 @@ Nur gegen Netze und Domains einsetzen, für die ihr berechtigt seid.
 import argparse
 import asyncio
 import concurrent.futures
+import errno
 import hashlib
 import html
 import ipaddress
@@ -50,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.9"
+VERSION = "3.10"
 SCHEMA_VERSION = "2"
 
 # ============================================================== Einstellungen
@@ -135,6 +136,9 @@ DNS_RATE_PER_SERVER = 20  # Anfragen/s je Nameserver – bleibt unter üblichen 
 DNS_ROUNDS = 3            # Versuche je Frage (mit Pause), falls Antworten verloren gehen
 CERT_WARN_DAYS = 30       # Warnung, wenn ein Zertifikat in weniger Tagen abläuft
 SOURCE_TIMEOUT = 60       # Sekunden je passiver Quelle und Domain (danach zählt, was bis dahin da ist)
+# Fehler, die am eigenen Rechner liegen und nichts über den Zielport aussagen (z. B. zu viele
+# offene Dateien). Solche Versuche werden wiederholt statt als „geschlossen“ gewertet.
+LOCAL_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM, errno.EADDRNOTAVAIL}
 MAX_ADDRESSES = 65536     # größere Netze bitte aufteilen oder masscan/naabu vorschalten
 CACHE_DIR = os.path.expanduser("~/.cache/webinventar")
 FINGERPRINT_URL = "https://raw.githubusercontent.com/projectdiscovery/wappalyzergo/main/fingerprints_data.json"
@@ -976,7 +980,7 @@ class Inventory:
         self.port_sem = asyncio.Semaphore(self.cfg["concurrency"])
         self.http_sem = asyncio.Semaphore(max(10, self.cfg["concurrency"] // 4))
         self.host_sems = {}
-        self.stats = {"tcp": 0, "http": 0}
+        self.stats = {"tcp": 0, "http": 0, "local_errors": 0}
         self.conn_per_ip = {}
         self.canary = {}         # IP -> Port, der nachweislich offen war
         self.blocked = {}        # IP -> Phase, nach der er nicht mehr antwortete
@@ -1217,13 +1221,22 @@ class Inventory:
 
     async def tcp_open(self, ip, port):
         async with self.host_slot(ip), self.port_sem:
-            await self.rate.wait()
-            self.stats["tcp"] += 1
-            self.conn_per_ip[ip] = self.conn_per_ip.get(ip, 0) + 1
-            try:
-                _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), self.cfg["timeout"])
-            except Exception:  # noqa: BLE001  (geschlossen oder gefiltert)
-                return False
+            for attempt in range(3):
+                await self.rate.wait()
+                self.stats["tcp"] += 1
+                self.conn_per_ip[ip] = self.conn_per_ip.get(ip, 0) + 1
+                try:
+                    _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), self.cfg["timeout"])
+                    break
+                except OSError as e:
+                    if e.errno not in LOCAL_ERRNOS:
+                        return False           # geschlossen, gefiltert oder Zeitüberschreitung
+                    if attempt == 2:           # Fehler am eigenen Rechner, Ergebnis unbekannt
+                        self.stats["local_errors"] += 1
+                        return False
+                    await asyncio.sleep(1 + attempt)
+                except Exception:  # noqa: BLE001
+                    return False
             w.close()
             try:
                 await asyncio.wait_for(w.wait_closed(), 2)
@@ -1633,6 +1646,7 @@ class Inventory:
                       "ports": len(self.ports)},
             "stats": {
                 "tcp_connections": self.stats["tcp"], "http_requests": self.stats["http"],
+                "local_errors": self.stats["local_errors"],
                 "max_connections_per_ip": {"ip": busiest[0], "count": busiest[1]} if busiest else None,
                 "dns": {"queries": self.dns.queries, "retries": self.dns.retries,
                         "throttled_servers": sorted(self.dns.throttled)},
@@ -1819,6 +1833,10 @@ class Inventory:
             print_table(["Hostname", "IP"], [[h["name"], cap_list(h["a"] + h["aaaa"], 40)]
                                              for h in elsewhere], [0, 0])
 
+        if self.stats["local_errors"]:
+            print(f"\n!!! {self.stats['local_errors']} Portprüfungen sind am eigenen Rechner gescheitert "
+                  "(z. B. zu viele offene Dateien), Ergebnisse unvollständig.\n    -> Mit --profil schonend "
+                  "erneut prüfen oder das Limit erhöhen (ulimit -n 4096).")
         if self.blocked:
             print(f"\n!!! {len(self.blocked)} IP(s) haben den Scanner offenbar gesperrt, Ergebnisse "
                   f"unvollständig: {', '.join(sorted(self.blocked))}\n    -> Scanner-IP freischalten "
@@ -1967,6 +1985,24 @@ def dechunk(body):
 
 # ============================================================== Kommandozeile
 
+def raise_fd_limit(need):
+    """Limit für offene Dateien auf mindestens need anheben (soweit erlaubt). Gibt das neue
+    Limit zurück, None, wenn das System keine solchen Limits kennt (Windows)."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= need:
+        return need
+    target = need if hard == resource.RLIM_INFINITY else min(need, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        return target
+    except (ValueError, OSError):
+        return soft
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Inventar öffentlich erreichbarer Webdienste für eigene Netze und Domains.",
@@ -2013,6 +2049,14 @@ def main():
     roots = a.root_servers.split(",") if a.root_servers else None
 
     cfg = PROFILES[a.profil]
+    # Jede gleichzeitige Verbindung braucht eine Datei-Beschreibung. Ist das Limit zu niedrig
+    # (macOS: 256), scheitern Verbindungen am eigenen Rechner statt am Ziel.
+    need = cfg["concurrency"] + 200
+    limit = raise_fd_limit(need)
+    if limit is not None and limit < need:
+        cfg = PROFILES[a.profil] = {**cfg, "concurrency": max(20, limit - 150)}
+        log(f"Hinweis: Nur {limit} offene Dateien erlaubt – höchstens {cfg['concurrency']} Verbindungen "
+            "gleichzeitig. Mit 'ulimit -n 4096' vor dem Aufruf geht es schneller.")
     attempts = total * len(ports)
     if cfg["rate"] and attempts / cfg["rate"] > 600:
         log(f"Hinweis: {attempts:,} Verbindungsversuche – bei Profil '{a.profil}' mindestens "
