@@ -81,6 +81,7 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
    - Namen in IP-Adressen auflösen, Wildcard-DNS auf jeder Ebene erkennen.
    - Verwaiste CNAMEs melden, also Einträge, deren Ziel nicht mehr existiert.
    - Fremde Namen, etwa aus der Rückwärtsauflösung oder aus Zertifikaten, nur behalten, wenn sie in die angegebenen Netze zeigen. Typisch sind Kundenseiten auf einem eigenen Webserver.
+   - Fremde Namen aus einem Zertifikat, das auch für die angegebenen Domains gilt (z. B. `example.org` im Zertifikat von `www.example.de`), außerdem behalten, wenn sie auf einen Server zeigen, auf den auch Namen der angegebenen Domains zeigen. Das funktioniert auch ohne `-n`. Zeigen sie woandershin, werden sie nicht geprüft, aber in der Übersicht aufgeführt. Ausgenommen sind Sammelzertifikate von Hostern und CDNs mit mehr als 100 Namen.
 3. **Portscan**
    - Angegebene Netze: die mit `-p` gewählte Portliste.
    - Fremde IP-Adressen, auf die die Hostnamen zeigen (Hoster, SaaS, CDN): nur 80 und 443.
@@ -95,12 +96,13 @@ Mindestens `-d` oder `-n` muss angegeben sein. In Dateien werden Leerzeilen und 
 
 ### Terminal
 
-Die Übersicht erscheint auf der Standardausgabe (STDOUT) und lässt sich mit `> bericht.txt` speichern. Fortschrittsmeldungen gehen auf STDERR. Die Übersicht hat vier Teile:
+Die Übersicht erscheint auf der Standardausgabe (STDOUT) und lässt sich mit `> bericht.txt` speichern. Fortschrittsmeldungen gehen auf STDERR. Die Übersicht hat bis zu fünf Teile:
 
 1. **Webdienste:** eine Zeile je IP-Adresse und Port mit gleicher Antwort, also gleichem Status, Titel, gleicher Technik und gleichem Zertifikatsstatus. Alle URLs mit dieser Antwort stehen untereinander in der ersten Spalte und lassen sich direkt im Browser öffnen. HTTP-Adressen, die nur auf HTTPS desselben Namens umleiten, werden nur gezählt.
 2. **Ohne Webdienst:** IP-Adressen mit Hostnamen oder offenen Ports, die kein HTTP sprechen. Ist nur eine Domain angegeben, fehlt sie in den Hostnamen, aus `www.example.de` wird also `www`. Aufeinanderfolgende Adressen mit durchnummerierten Namen werden zusammengefasst, z. B. `203.0.113.10 – 19  pc-0 … 9`.
-3. **Auffälligkeiten**, nach Schwere sortiert (`hoch`, `mittel`, `gering`), jeweils mit allen betroffenen Adressen.
-4. **Statistik:** Hostnamen, Quellen, offene Ports, Last und Pfad der JSON-Datei.
+3. **Weitere Namen aus euren Zertifikaten:** fremde Namen aus Zertifikaten der angegebenen Domains, die auf andere Server zeigen und deshalb nicht geprüft wurden. Gehören sie zum eigenen Bestand, beim nächsten Lauf mit `-d` angeben.
+4. **Auffälligkeiten**, nach Schwere sortiert (`hoch`, `mittel`, `gering`), jeweils mit allen betroffenen Adressen.
+5. **Statistik:** Hostnamen, Quellen, offene Ports, Last und Pfad der JSON-Datei.
 
 ### JSON-Datei
 
@@ -115,7 +117,7 @@ Die Feldnamen lehnen sich an das [Elastic Common Schema (ECS)](https://www.elast
 | `stats` | Verbindungen, DNS-Anfragen (`stats.dns`), Hostnamen (`stats.hosts`, nicht auflösbare nur als Anzahl je Status), Ergebnis je passiver Quelle (`stats.sources`) |
 | `findings` | Auffälligkeiten: `rule.name` (Art), `event.severity` (3 = hoch, 2 = mittel, 1 = gering), `message`, `targets` |
 | `services` | ein Eintrag je URL bzw. offenem Port ohne HTTP. Er lässt sich einzeln z. B. in Elasticsearch oder OpenSearch laden. |
-| `hosts` | aufgelöste Hostnamen mit IP-Adressen (`resolved_ip`), CNAME-Kette und Fundquellen (z. B. `certspotter`, `wortliste`, `zertifikat`, `http-inhalt`). Namen, die nicht existieren, werden nicht exportiert. Verwaiste CNAMEs bleiben enthalten. |
+| `hosts` | aufgelöste Hostnamen mit IP-Adressen (`resolved_ip`), CNAME-Kette und Fundquellen (z. B. `certspotter`, `wortliste`, `zertifikat`, `http-inhalt`). Namen, die nicht existieren, werden nicht exportiert. Verwaiste CNAMEs bleiben enthalten, ebenso fremde Namen aus euren Zertifikaten, die nicht geprüft wurden (`webinventar.status: "out-of-scope"`). |
 | `ips` | je IP-Adresse: PTR-Eintrag (`domain`), offene Ports, Hostnamen, Sperrhinweis |
 | `certificates` | jedes gefundene Zertifikat einmal, mit SHA-256-Fingerprint als Schlüssel, Aussteller, Laufzeit und allen Namen (SANs). `services[].tls.server.hash.sha256` verweist darauf. |
 

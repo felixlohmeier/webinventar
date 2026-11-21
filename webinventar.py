@@ -17,7 +17,9 @@ Ablauf:
   1. Hostnamen sammeln: 7 passive Quellen, DNS-Records, Zonentransfer-Versuch,
      Wortliste, PTR-Records eurer Netze; später Zertifikats-SANs, Redirects und
      Namen aus Seiteninhalt und Headern der abgerufenen Antworten.
-  2. Auflösen, Wildcards erkennen, verwaiste CNAMEs melden.
+  2. Auflösen, Wildcards erkennen, verwaiste CNAMEs melden. Fremde Namen nur
+     behalten, wenn sie in eure Netze zeigen oder – aus Zertifikaten, die auch
+     für eure Domains gelten – auf dieselben Server wie eure Domains.
   3. Portscan: eigene Netze mit voller Portliste, fremde IPs, auf die eure
      Namen zeigen (Hoster, SaaS), nur auf 80/443.
   4. HTTP/HTTPS-Abruf je IP:Port und je Hostname (Host-Header + SNI), Redirects
@@ -48,7 +50,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.8"
+VERSION = "3.9"
 SCHEMA_VERSION = "2"
 
 # ============================================================== Einstellungen
@@ -992,24 +994,28 @@ class Inventory:
             return False
         return any(addr in n for n in self.nets)
 
-    def add_host(self, name, source, foreign_ok=False):
+    def add_host(self, name, source, foreign_ok=False, own_cert=False):
         """Namen aufnehmen. Fremde Namen (nicht unter euren Domains) nur, wenn foreign_ok –
-        sie werden später nur behalten, wenn sie in eure Netze auflösen."""
+        sie werden später nur behalten, wenn sie in eure Netze auflösen. own_cert: fremder
+        Name aus einem Zertifikat, das auch für eure Domains gilt; er wird zusätzlich behalten,
+        wenn er auf einen Server zeigt, auf den auch Namen eurer Domains zeigen."""
         name = norm_name(name)
         if not name:
             return False
         ours = self.in_domains(name)
-        if not ours and not (foreign_ok and self.nets):
+        if not ours and not ((foreign_ok and self.nets) or own_cert):
             return False
         if name in self.hosts:
             self.hosts[name]["sources"].add(source)
+            if own_cert and not ours:
+                self.hosts[name]["own_cert"] = True
             return False
         if not ours:
             if self.foreign_count >= 2000:
                 return False
             self.foreign_count += 1
         self.hosts[name] = {"name": name, "status": "pending", "a": [], "aaaa": [], "cname": [],
-                            "sources": {source}, "net_only": not ours}
+                            "sources": {source}, "net_only": not ours, "own_cert": own_cert and not ours}
         return True
 
     def ipinfo(self, ip):
@@ -1023,6 +1029,11 @@ class Inventory:
         fd = self.findings.setdefault((kind, group or detail), {"type": kind, "detail": detail, "targets": []})
         if target not in fd["targets"]:
             fd["targets"].append(target)
+
+    @staticmethod
+    def elsewhere(h):
+        """Fremder Name aus einem eurer Zertifikate, der nicht auf eure Server zeigt (nicht geprüft)."""
+        return h["own_cert"] and h["status"] == "out-of-scope"
 
     def live_hosts(self):
         return [h for h in self.hosts.values() if h["status"].startswith("resolved")]
@@ -1172,14 +1183,17 @@ class Inventory:
     async def resolve_pending(self):
         pending = [h for h in self.hosts.values() if h["status"] == "pending"]
         sem = asyncio.Semaphore(100)
+        # Server, auf die Namen eurer Domains zeigen (aus den Runden davor)
+        own_ips = {i for h in self.live_hosts() if not h["net_only"] for i in h["a"] + h["aaaa"]}
 
         async def one(h):
             async with sem:
                 await self.resolve_host(h)
             if h["status"] != "resolved":
                 return
-            if h["net_only"] and not any(self.in_net(i) for i in h["a"] + h["aaaa"]):
-                h["status"] = "out-of-scope"       # fremder Name, zeigt nicht in eure Netze
+            addrs = h["a"] + h["aaaa"]
+            if h["net_only"] and not any(self.in_net(i) or (h["own_cert"] and i in own_ips) for i in addrs):
+                h["status"] = "out-of-scope"       # fremder Name, zeigt nicht auf eure Server
             elif not h["net_only"] and await self.is_wildcard(h):
                 # Nur geratene Namen verwerfen; Namen aus CT/Archiven bleiben, markiert
                 h["status"] = "wildcard" if h["sources"] == {"wortliste"} else "resolved (wildcard)"
@@ -1391,7 +1405,9 @@ class Inventory:
                 ip = next((r.value for r in await self.q(host, "A")), None)
             elif self.in_net(host):                               # IP-Adresse in eurem Netz
                 ip, host = host, None
-            if not ip or not (self.in_net(ip) or (host and self.in_domains(host))):
+            # fremder Name, der auf eure Server zeigt und deshalb behalten wurde
+            kept = bool(known and known["net_only"] and known["status"].startswith("resolved"))
+            if not ip or not (self.in_net(ip) or kept or (host and self.in_domains(host))):
                 return chain, None
             path = (p.path or "/") + (f"?{p.query}" if p.query else "")
             nxt = await self.http(ip, p.port or (443 if p.scheme == "https" else 80), host,
@@ -1444,10 +1460,15 @@ class Inventory:
             "cert_valid": "" if ver is None else
             ("ja" if ver.get("verified") else f"nein: {ver.get('verify_error', 'Fehler')}"),
         })
-        # Neue Namen aus dem Zertifikat. Fremde Namen nur von Diensten in euren Netzen,
-        # sonst würden z. B. die hunderten SANs eines Hoster-Zertifikats aufgelöst.
-        for san in res.get("cert_sans", []) + [res.get("cert_cn", "")]:
-            self.add_host(san, "zertifikat", foreign_ok=self.in_net(ip))
+        # Neue Namen aus dem Zertifikat. Fremde Namen nur von Diensten in euren Netzen oder
+        # aus Zertifikaten, die auch für eure Domains ausgestellt sind (dann gehören die übrigen
+        # Namen sehr wahrscheinlich demselben Betreiber). Sammelzertifikate von Hostern und CDNs
+        # mit sehr vielen Namen sind ausgenommen, sonst würden hunderte fremde Namen aufgelöst.
+        names = res.get("cert_sans", []) + [res.get("cert_cn", "")]
+        own_cert = (len(names) <= CERT_MAX_NAMES
+                    and any(self.in_domains(norm_name(n) or "") for n in names))
+        for san in names:
+            self.add_host(san, "zertifikat", foreign_ok=self.in_net(ip), own_cert=own_cert)
         for r in (res, final):
             self.harvest_names(r)
             m = ERROR_DETAILS.search(r["body"][:150000]) if r and r.get("http") else None
@@ -1593,7 +1614,7 @@ class Inventory:
         """Alle Ergebnisse als ein Dokument. Feldnamen lehnen sich an das Elastic Common Schema
         (ECS) an; was ECS nicht kennt, steht unter 'webinventar'. Leere Felder entfallen."""
         rows = sorted(self.services, key=lambda r: (ip_sort_key(r["ip"]), r["port"], r["hostname"]))
-        hosts = sorted((h for h in self.hosts.values() if h["status"] in KEEP_STATUS),
+        hosts = sorted((h for h in self.hosts.values() if h["status"] in KEEP_STATUS or self.elsewhere(h)),
                        key=lambda h: h["name"].split(".")[::-1])
         unresolved = {}
         for h in self.hosts.values():
@@ -1615,7 +1636,7 @@ class Inventory:
                 "max_connections_per_ip": {"ip": busiest[0], "count": busiest[1]} if busiest else None,
                 "dns": {"queries": self.dns.queries, "retries": self.dns.retries,
                         "throttled_servers": sorted(self.dns.throttled)},
-                "hosts": {"resolved": len(hosts), "unresolved": unresolved},
+                "hosts": {"resolved": sum(h["status"] in KEEP_STATUS for h in hosts), "unresolved": unresolved},
                 "sources": self.source_stats,
             },
             "findings": [{"rule": {"name": fd["type"]},
@@ -1790,6 +1811,14 @@ class Inventory:
             print(f"\n=== Ohne Webdienst ({len(quiet)}) ===")
             print_table(["IP", "Ports", "Hostnamen"], quiet, [36, 20, 0])
 
+        elsewhere = sorted((h for h in self.hosts.values() if self.elsewhere(h)),
+                           key=lambda h: h["name"].split(".")[::-1])
+        if elsewhere:
+            print(f"\n=== Weitere Namen aus euren Zertifikaten, nicht geprüft ({len(elsewhere)}) ===")
+            print("  Sie zeigen auf andere Server als eure Domains. Zum Prüfen mit -d angeben.")
+            print_table(["Hostname", "IP"], [[h["name"], cap_list(h["a"] + h["aaaa"], 40)]
+                                             for h in elsewhere], [0, 0])
+
         if self.blocked:
             print(f"\n!!! {len(self.blocked)} IP(s) haben den Scanner offenbar gesperrt, Ergebnisse "
                   f"unvollständig: {', '.join(sorted(self.blocked))}\n    -> Scanner-IP freischalten "
@@ -1808,7 +1837,7 @@ class Inventory:
                          for h in self.hosts.values())
         live = self.live_hosts()
         foreign = sum(h["net_only"] for h in live)
-        print(f"Hostnamen:  {len(live)} aufgelöst" + (f" (davon {foreign} fremde in euren Netzen)" if foreign else "")
+        print(f"Hostnamen:  {len(live)} aufgelöst" + (f" (davon {foreign} fremde auf euren Servern)" if foreign else "")
               + f", {unresolved} nicht auflösbar (nicht exportiert)")
         ranked = sorted(((v["names"], v["exclusive"], s) for s, v in self.source_stats.items() if v["names"]),
                         reverse=True)
@@ -1828,6 +1857,9 @@ class Inventory:
         print(f"Datei:      {path}")
 
 
+# Zertifikate mit mehr Namen gelten als Sammelzertifikate (Hoster, CDN): fremde Namen daraus
+# werden nicht übernommen
+CERT_MAX_NAMES = 100
 # Hosts mit diesem Status kommen in die JSON-Datei, alle anderen werden nur gezählt
 KEEP_STATUS = ("resolved", "resolved (wildcard)", "dangling-cname")
 SEVERITY = {"Zonentransfer offen": 3, "Verwaister CNAME": 3, "Zertifikat abgelaufen": 3,
