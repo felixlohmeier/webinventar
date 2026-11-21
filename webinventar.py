@@ -51,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "3.10"
+VERSION = "0.3.10"
 SCHEMA_VERSION = "2"
 
 # ============================================================== Einstellungen
