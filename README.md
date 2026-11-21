@@ -114,7 +114,7 @@ Die Feldnamen lehnen sich an das [Elastic Common Schema (ECS)](https://www.elast
 |---|---|
 | `@timestamp`, `event`, `observer`, `schema_version` | Zeitpunkt, Beginn und Ende des Laufs, Version des Tools und des Formats |
 | `scope` | angegebene Domains und Netze |
-| `stats` | Verbindungen, DNS-Anfragen (`stats.dns`), Hostnamen (`stats.hosts`, nicht auflösbare nur als Anzahl je Status), Ergebnis je passiver Quelle (`stats.sources`) |
+| `stats` | Verbindungen, am eigenen Rechner gescheiterte Portprüfungen (`local_errors`), DNS-Anfragen (`stats.dns`), Hostnamen (`stats.hosts`, nicht auflösbare nur als Anzahl je Status), Ergebnis je passiver Quelle (`stats.sources`) |
 | `findings` | Auffälligkeiten: `rule.name` (Art), `event.severity` (3 = hoch, 2 = mittel, 1 = gering), `message`, `targets` |
 | `services` | ein Eintrag je URL bzw. offenem Port ohne HTTP. Er lässt sich einzeln z. B. in Elasticsearch oder OpenSearch laden. |
 | `hosts` | aufgelöste Hostnamen mit IP-Adressen (`resolved_ip`), CNAME-Kette und Fundquellen (z. B. `certspotter`, `wortliste`, `zertifikat`, `http-inhalt`). Namen, die nicht existieren, werden nicht exportiert. Verwaiste CNAMEs bleiben enthalten, ebenso fremde Namen aus euren Zertifikaten, die nicht geprüft wurden (`webinventar.status: "out-of-scope"`). |
@@ -168,6 +168,8 @@ Dazu kommen pro Lauf etwa 2–4 Minuten für passive Quellen (höchstens 60 Seku
 Empfehlung: Die IP-Adresse des Scan-Rechners in fail2ban (`ignoreip`), im IPS und in der WAF als Ausnahme eintragen. Alternativ betroffene IP-Adressen einzeln mit `--profil schonend -n <IP>` erneut prüfen.
 
 ## Grenzen
+
+- **Eigener Rechner:** Jede gleichzeitige Verbindung braucht eine offene Datei. Das Skript hebt das Limit dafür beim Start selbst an (macOS erlaubt standardmäßig nur 256). Geht das nicht, verringert es die Zahl gleichzeitiger Verbindungen. Scheitern Portprüfungen trotzdem am eigenen Rechner, wiederholt es sie und warnt am Ende, statt den Port als geschlossen zu werten. Bei langen Läufen auf einem Laptop den Ruhezustand verhindern, unter macOS z. B. mit `caffeinate -i python3 webinventar.py …`.
 
 - **Ports:** Es wird nur die gewählte Portliste geprüft. Mit `-p all` sind alle Ports abgedeckt, das dauert aber sehr lange. Für große Netze besser vorher masscan oder naabu laufen lassen und die offenen Ports mit `-p` übergeben.
 - **Hostnamen:** Hostnamen, die in keinem Zertifikat, keiner Subdomain-Datenbank, keiner Wortliste und keinem DNS-Eintrag vorkommen, findet das Tool nur, wenn sie in die angegebenen Netze zeigen oder auf einer gefundenen Seite verlinkt sind. Verlinkte JavaScript-Dateien werden dabei nicht zusätzlich abgerufen. Gegenüber Tools wie subfinder fehlen die Quellen, die einen API-Schlüssel erfordern.
