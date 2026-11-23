@@ -51,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.3.10"
+VERSION = "0.3.11"
 SCHEMA_VERSION = "2"
 
 # ============================================================== Einstellungen
@@ -2062,13 +2062,23 @@ def main():
         log(f"Hinweis: {attempts:,} Verbindungsversuche – bei Profil '{a.profil}' mindestens "
             f"{attempts / cfg['rate'] / 60:.0f} Minuten.")
 
-    inv = Inventory(domains, nets, ports, a.profil, a.wordlist, not a.no_tech, roots, overrides)
-    path = output_path(a.out, norm_name(domains[0]) if domains else nets[0], inv.started)
+    # Inventory erst in der laufenden Event-Loop anlegen: Unter Python 3.9 binden sich
+    # Semaphore und Locks beim Erzeugen an eine Loop, asyncio.run() startet aber eine neue.
+    inv = None
+
+    async def go():
+        nonlocal inv
+        inv = Inventory(domains, nets, ports, a.profil, a.wordlist, not a.no_tech, roots, overrides)
+        await inv.run()
+
     try:
-        asyncio.run(inv.run())
+        asyncio.run(go())
     except KeyboardInterrupt:
+        if inv is None:
+            raise
         log("Abgebrochen – schreibe bisherige Ergebnisse.")
         inv.analyse()
+    path = output_path(a.out, norm_name(domains[0]) if domains else nets[0], inv.started)
     inv.write(path)
     inv.summary(path, time.time() - inv.started)
 
