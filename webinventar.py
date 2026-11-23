@@ -2064,11 +2064,14 @@ def main():
 
     # Inventory erst in der laufenden Event-Loop anlegen: Unter Python 3.9 binden sich
     # Semaphore und Locks beim Erzeugen an eine Loop, asyncio.run() startet aber eine neue.
-    inv = None
+    # Den Ausgabepfad vor dem Scan bestimmen, damit ein ungültiges -o sofort auffällt.
+    inv = path = None
+    first = norm_name(domains[0]) if domains else nets[0]
 
     async def go():
-        nonlocal inv
+        nonlocal inv, path
         inv = Inventory(domains, nets, ports, a.profil, a.wordlist, not a.no_tech, roots, overrides)
+        path = output_path(a.out, first, inv.started)
         await inv.run()
 
     try:
@@ -2078,7 +2081,8 @@ def main():
             raise
         log("Abgebrochen – schreibe bisherige Ergebnisse.")
         inv.analyse()
-    path = output_path(a.out, norm_name(domains[0]) if domains else nets[0], inv.started)
+    if path is None:
+        path = output_path(a.out, first, inv.started)
     inv.write(path)
     inv.summary(path, time.time() - inv.started)
 
